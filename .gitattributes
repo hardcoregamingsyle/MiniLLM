@@ -1,0 +1,10 @@
+# Normalize to LF in the repo. Linux clone gets LF everywhere; Windows gets
+# LF too, which every modern editor and Python handles fine.
+* text=auto eol=lf
+# Windows batch must be CRLF to run correctly under cmd.exe.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+# Never touch binaries.
+*.gguf binary
+*.safetensors binary
+*.png binary
