@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Machine profiles. Bandwidths are MEASURED, not spec-sheet, wherever possible.",
+    "Run bench/roofline.py on a new machine and paste its numbers in as a new entry.",
+    "dram_gbps  : peak multi-threaded streaming read, GB/s",
+    "disk_gbps  : random read at expert-block granularity, saturated queue depth, GB/s",
+    "kernel_gbps: rate the SIMD dequant+GEMV kernel can consume PACKED weight bytes.",
+    "             This is a ceiling independent of where the bytes came from.",
+    "ram_total_gb / os_reserve_gb / runtime_reserve_gb -> weight budget",
+    "free_disk_gb: space available to store the quantized model"
+  ],
+
+  "laptop-i5-8350u": {
+    "label": "Work laptop - i5-8350U, 8GB single-channel DDR4-2400, SATA SSD",
+    "measured": true,
+    "dram_gbps": 15.34,
+    "disk_gbps": 0.508,
+    "kernel_gbps": 6.0,
+    "kernel_gbps_note": "estimate: 4 cores AVX2, no VNNI. Replace once the real kernel is benchmarked.",
+    "ram_total_gb": 8.0,
+    "os_reserve_gb": 3.0,
+    "runtime_reserve_gb": 1.0,
+    "free_disk_gb": 80.0,
+    "cores": 4,
+    "simd": "avx2",
+    "targets": { "aim_tok_s": 1.0, "floor_tok_s": 0.5 }
+  },
+
+  "server-32gb-nvme": {
+    "label": "Server laptop - 32GB dual-channel DDR4-3200, Gen4 NVMe, 900GB free",
+    "measured": false,
+    "dram_gbps": 41.0,
+    "dram_gbps_note": "51.2 theoretical x 0.80 efficiency observed on the laptop. VERIFY with roofline.py.",
+    "disk_gbps": 5.5,
+    "disk_gbps_note": "Gen4 x4 rated 7.0 sequential; 5.5 assumed for large random reads at QD8+. VERIFY.",
+    "kernel_gbps": 24.0,
+    "kernel_gbps_note": "estimate: 8 cores. Raise if the CPU has AVX-512/VNNI.",
+    "ram_total_gb": 32.0,
+    "os_reserve_gb": 3.0,
+    "runtime_reserve_gb": 1.5,
+    "free_disk_gb": 900.0,
+    "cores": 8,
+    "simd": "avx512",
+    "targets": { "aim_tok_s": 2.0, "floor_tok_s": 1.0 }
+  }
+}

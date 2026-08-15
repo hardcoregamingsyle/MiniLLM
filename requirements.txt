@@ -1,0 +1,11 @@
+# Core -- everything in bench/, sim/, minillm/, scripts/ needs only these.
+numpy>=2.0
+huggingface_hub>=0.30
+
+# Faster, chunked downloads from the Hub. Optional; huggingface_hub falls back
+# to plain HTTPS without it.
+hf-xet>=1.0
+
+# NOT required: torch / transformers. Inference here goes through llama.cpp,
+# which is a separate native build (see SETUP_LINUX.md step 4). Pulling torch
+# in would add ~2 GB for nothing.

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Model weights and caches -- never commit these. They live outside the repo
+# (D:\minillm on Windows, ~/minillm on Linux) but guard anyway.
+*.gguf
+*.safetensors
+*.bin
+hf/
+hub/
+xet/
+models--*/
+
+# Benchmark scratch and per-machine run logs
+bench_scratch/
+results/*.log
+results/*.err
+
+# Secrets. HF_TOKEN goes in the environment, not the tree.
+.env
+*.token
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

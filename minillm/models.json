@@ -1,0 +1,119 @@
+{
+  "_comment": [
+    "Parameter decomposition per model. Counts are PARAMETERS, not bytes.",
+    "",
+    "The split that matters is resident vs streamable:",
+    "  attn/lm_head/router/shared_expert -> touched every token, can never be evicted",
+    "  embed                             -> a GATHER, not a matmul. One row per token.",
+    "                                       Costs ~0 bandwidth, so it is NOT resident.",
+    "  routed_expert_pool                -> streams from disk, cached by policy",
+    "",
+    "Values here are derived from config.json. Run scripts/derive_spec.py once",
+    "weights are local to replace them with exact sums over safetensors shapes."
+  ],
+  "gpt-oss-120b": {
+    "repo": "openai/gpt-oss-120b",
+    "source": "derive_spec.py",
+    "num_layers": 36,
+    "num_moe_layers": 36,
+    "hidden_size": 2880,
+    "num_experts": 128,
+    "experts_per_tok": 4,
+    "moe_intermediate_size": 2880,
+    "expert_matrices": 3,
+    "mtp_layers": 0,
+    "params": {
+      "attn": 924414720,
+      "lm_head": 579133440,
+      "router": 13271040,
+      "shared_expert": 0,
+      "embed_gather_only": 579133440,
+      "routed_expert_pool": 114661785600
+    },
+    "notes": "derived; total from supplied"
+  },
+  "qwen3.8-2.4t-a95b": {
+    "repo": "Qwen/Qwen3.8-2.4T-A95B",
+    "source": "derive_spec.py",
+    "num_layers": 92,
+    "num_moe_layers": 92,
+    "hidden_size": 8192,
+    "num_experts": 512,
+    "experts_per_tok": 10,
+    "moe_intermediate_size": 2048,
+    "expert_matrices": 3,
+    "mtp_layers": 1,
+    "params": {
+      "attn": 41644258816,
+      "lm_head": 2034237440,
+      "router": 385875968,
+      "shared_expert": 4630511616,
+      "embed_gather_only": 2034237440,
+      "routed_expert_pool": 2370821947392
+    },
+    "notes": "derived; total from supplied"
+  },
+  "deepseek-v3": {
+    "repo": "deepseek-ai/DeepSeek-V3",
+    "source": "derive_spec.py",
+    "num_layers": 61,
+    "num_moe_layers": 58,
+    "hidden_size": 7168,
+    "num_experts": 256,
+    "experts_per_tok": 8,
+    "moe_intermediate_size": 2048,
+    "expert_matrices": 3,
+    "mtp_layers": 1,
+    "params": {
+      "attn": 14343156224,
+      "lm_head": 926679040,
+      "router": 106430464,
+      "shared_expert": 1189085184,
+      "embed_gather_only": 926679040,
+      "routed_expert_pool": 653908770816
+    },
+    "notes": "derived; total from supplied"
+  },
+  "kimi-k2": {
+    "repo": "moonshotai/Kimi-K2-Instruct",
+    "source": "derive_spec.py",
+    "num_layers": 61,
+    "num_moe_layers": 60,
+    "hidden_size": 7168,
+    "num_experts": 384,
+    "experts_per_tok": 8,
+    "moe_intermediate_size": 2048,
+    "expert_matrices": 3,
+    "mtp_layers": 0,
+    "params": {
+      "attn": 9124790272,
+      "lm_head": 1174405120,
+      "router": 165150720,
+      "shared_expert": 396361728,
+      "embed_gather_only": 1174405120,
+      "routed_expert_pool": 1014686023680
+    },
+    "notes": "derived; total from supplied"
+  },
+  "qwen3.5-397b-a17b": {
+    "repo": "Qwen/Qwen3.5-397B-A17B",
+    "source": "derive_spec.py",
+    "num_layers": 60,
+    "num_moe_layers": 60,
+    "hidden_size": 4096,
+    "num_experts": 512,
+    "experts_per_tok": 10,
+    "moe_intermediate_size": 1024,
+    "expert_matrices": 3,
+    "mtp_layers": 1,
+    "params": {
+      "attn": 7552330240,
+      "lm_head": 1017118720,
+      "router": 125829120,
+      "shared_expert": 754974720,
+      "embed_gather_only": 1017118720,
+      "routed_expert_pool": 386547056640
+    },
+    "notes": "derived; total from supplied"
+  }
+}
