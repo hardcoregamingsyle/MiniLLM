@@ -330,6 +330,11 @@ def main():
     os.makedirs(RESULTS, exist_ok=True)
     out = (cmd_generate(args, model) if args.generate else
            {"mode": "bench", "rows": cmd_bench(args, model)})
+    # A run that never launched llama.cpp (refused --draft, missing binary)
+    # must not overwrite a real result on disk with a stub.
+    if out.get("error"):
+        print(f"\nnot writing results: {out['error']}")
+        return 2
     out["model"] = model
     out["model_bytes"] = size
 
@@ -342,7 +347,17 @@ def main():
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
     print(f"\nwrote {path}")
-    return 0
+
+    # Propagate failure. A refused --draft (no draft file), a non-zero llama.cpp
+    # exit, or a bench that could not run must NOT look like success to a
+    # caller -- CI caught this returning 0 after printing an ERROR.
+    if out.get("error"):
+        return 2
+    rc = out.get("exit")
+    if rc is None and out.get("rows"):
+        bad = [r for r in out["rows"] if r.get("error") or (r.get("exit") not in (0, None))]
+        rc = 1 if bad else 0
+    return 0 if rc in (0, None) else (rc if isinstance(rc, int) and 0 < rc < 256 else 1)
 
 
 if __name__ == "__main__":
