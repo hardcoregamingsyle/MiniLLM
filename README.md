@@ -1,5 +1,7 @@
 # MiniLLM — running trillion-parameter MoE models on machines with 8–32 GB of RAM
 
+[![ci](https://github.com/hardcoregamingsyle/MiniLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/hardcoregamingsyle/MiniLLM/actions/workflows/ci.yml)
+
 CPU inference for Mixture-of-Experts models far larger than RAM, streaming
 experts from disk. The bet: **a router-aware expert cache beats the OS page
 cache**, because the OS evicts 4 KB pages by LRU and has no idea what a router is.
@@ -8,7 +10,11 @@ cache**, because the OS evicts 4 KB pages by LRU and has no idea what a router i
 
 One command does the whole setup — packages, clone, Python env, HF token,
 llama.cpp built for your CPU, hardware calibration, and the 630 GB model
-download started in a `tmux` session:
+download started in a `tmux` session. **Every push runs this exact installer
+on a fresh Ubuntu VM** (see the badge): cold install → re-run and assert
+nothing changed → build llama.cpp → calibrate → fetch a 12 GB MoE → prove
+`run.sh`, `--draft`, and the harness end-to-end. Green means the commands
+below work on a machine nobody has touched.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hardcoregamingsyle/MiniLLM/main/install.sh | bash

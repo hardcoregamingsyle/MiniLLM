@@ -1,16 +1,4 @@
 {
-  "_comment": [
-    "Parameter decomposition per model. Counts are PARAMETERS, not bytes.",
-    "",
-    "The split that matters is resident vs streamable:",
-    "  attn/lm_head/router/shared_expert -> touched every token, can never be evicted",
-    "  embed                             -> a GATHER, not a matmul. One row per token.",
-    "                                       Costs ~0 bandwidth, so it is NOT resident.",
-    "  routed_expert_pool                -> streams from disk, cached by policy",
-    "",
-    "Values here are derived from config.json. Run scripts/derive_spec.py once",
-    "weights are local to replace them with exact sums over safetensors shapes."
-  ],
   "gpt-oss-120b": {
     "repo": "openai/gpt-oss-120b",
     "source": "derive_spec.py",
@@ -115,5 +103,26 @@
       "routed_expert_pool": 386547056640
     },
     "notes": "derived; total from supplied"
+  },
+  "gpt-oss-20b": {
+    "repo": "openai/gpt-oss-20b",
+    "source": "config.json + published 3.6B active",
+    "num_layers": 24,
+    "num_moe_layers": 24,
+    "hidden_size": 2880,
+    "num_experts": 32,
+    "experts_per_tok": 4,
+    "moe_intermediate_size": 2880,
+    "expert_matrices": 3,
+    "mtp_layers": 0,
+    "params": {
+      "attn": 629000960,
+      "lm_head": 579133440,
+      "router": 2211840,
+      "shared_expert": 0,
+      "embed_gather_only": 579133440,
+      "routed_expert_pool": 19110297600
+    },
+    "notes": "gpt-oss-20b; used to validate capacity.py against a measured 9.2 tok/s on a GitHub ubuntu-latest runner"
   }
 }

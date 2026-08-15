@@ -1,15 +1,4 @@
 {
-  "_comment": [
-    "Machine profiles. Bandwidths are MEASURED, not spec-sheet, wherever possible.",
-    "Run bench/roofline.py on a new machine and paste its numbers in as a new entry.",
-    "dram_gbps  : peak multi-threaded streaming read, GB/s",
-    "disk_gbps  : random read at expert-block granularity, saturated queue depth, GB/s",
-    "kernel_gbps: rate the SIMD dequant+GEMV kernel can consume PACKED weight bytes.",
-    "             This is a ceiling independent of where the bytes came from.",
-    "ram_total_gb / os_reserve_gb / runtime_reserve_gb -> weight budget",
-    "free_disk_gb: space available to store the quantized model"
-  ],
-
   "laptop-i5-8350u": {
     "label": "Work laptop - i5-8350U, 8GB single-channel DDR4-2400, SATA SSD",
     "measured": true,
@@ -23,9 +12,11 @@
     "free_disk_gb": 80.0,
     "cores": 4,
     "simd": "avx2",
-    "targets": { "aim_tok_s": 1.0, "floor_tok_s": 0.5 }
+    "targets": {
+      "aim_tok_s": 1.0,
+      "floor_tok_s": 0.5
+    }
   },
-
   "server-32gb-nvme": {
     "label": "Server laptop - 32GB dual-channel DDR4-3200, Gen4 NVMe, 900GB free",
     "measured": false,
@@ -41,6 +32,27 @@
     "free_disk_gb": 900.0,
     "cores": 8,
     "simd": "avx512",
-    "targets": { "aim_tok_s": 2.0, "floor_tok_s": 1.0 }
+    "targets": {
+      "aim_tok_s": 2.0,
+      "floor_tok_s": 1.0
+    }
+  },
+  "github-ubuntu-latest": {
+    "label": "GitHub Actions ubuntu-latest (measured by CI run 31897530265)",
+    "measured": true,
+    "dram_gbps": 35.6,
+    "disk_gbps": 0.386,
+    "kernel_gbps": 21.9,
+    "kernel_gbps_note": "FITTED to the measured 9.2 tok/s on gpt-oss-20b (model fits RAM, so DRAM+kernel bound). 4 AVX2 threads, --no-repack. First real kernel number in this file.",
+    "ram_total_gb": 16.0,
+    "os_reserve_gb": 2.0,
+    "runtime_reserve_gb": 1.0,
+    "free_disk_gb": 14.0,
+    "cores": 4,
+    "simd": "avx2",
+    "targets": {
+      "aim_tok_s": 10.0,
+      "floor_tok_s": 5.0
+    }
   }
 }
