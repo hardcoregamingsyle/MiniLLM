@@ -115,13 +115,20 @@ def run(cmd, timeout, stdin_eof=False):
 TG_RE = re.compile(r"\|\s*tg(\d+)\s*\|\s*([0-9.]+)\s*±", re.I)
 PP_RE = re.compile(r"\|\s*pp(\d+)\s*\|\s*([0-9.]+)\s*±", re.I)
 
-# llama-cli in build b10437+ is a chat frontend on top of llama-server. It does
-# NOT print the classic "eval time = ... tokens per second" line -- that only
-# appears with --perf, which defaults to off. What it prints after each turn is:
+# Which binary does generation. In build b10437+ `llama-cli` became a chat
+# frontend on top of llama-server: it ignores -no-cnv, prints only a rounded
 #     [ Prompt: 0.1 t/s | Generation: 0.0 t/s ]
-# and then drops to an interactive ">" prompt even with -no-cnv, so a scripted
-# run must feed it EOF on stdin or it will block forever.
+# summary, and on EOF from stdin it prints ">" and loops FOREVER (46k prompt
+# lines in one log here) instead of exiting. It is unusable for scripting.
+# `llama-completion` is the classic non-chat binary: honors -no-cnv and
+# --no-repack, exits when done, and with --perf prints the real breakdown:
+#     llama_perf_context_print: prompt eval time = ... / N tokens ( ... ms per token, X tokens per second)
+#     llama_perf_context_print:        eval time = ... / N runs   ( ... ms per token, X tokens per second)
+GEN_BIN = "llama-completion"
 CLI_RATE_RE = re.compile(r"\[\s*Prompt:\s*([0-9.]+)\s*t/s\s*\|\s*Generation:\s*([0-9.]+)\s*t/s\s*\]")
+PERF_PROMPT_RE = re.compile(r"prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*tokens.*?([0-9.]+)\s*tokens per second", re.I)
+PERF_EVAL_RE = re.compile(r"(?<!prompt )eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*runs.*?([0-9.]+)\s*tokens per second", re.I)
+PERF_LOAD_RE = re.compile(r"load time\s*=\s*([0-9.]+)\s*ms", re.I)
 
 
 def parse_bench(out):
@@ -150,13 +157,13 @@ def cmd_bench(args, model):
     #   done_getting_tensors: ... cannot be used with preferred buffer type CPU_REPACK
     #   alloc_tensor_range: failed to allocate CPU_REPACK buffer of size 60914073600
     # It is still the right tool for models that DO fit (clean table output).
-    # For models larger than RAM use --generate (llama-cli honors --no-repack).
+    # For models larger than RAM use --generate (llama-completion honors --no-repack).
     model_gb = gb(os.path.getsize(model))
     ram_gb = total_ram_gb()
     if ram_gb and model_gb > ram_gb * 0.85:
         print(f"REFUSING llama-bench: model is {model_gb:.1f} GB, RAM is {ram_gb:.1f} GB.")
         print(f"llama-bench always repacks (no --no-repack) and will fail to allocate.")
-        print(f"Use --generate, which runs llama-cli --no-repack --perf instead.")
+        print(f"Use --generate, which runs llama-completion --no-repack --perf instead.")
         return [{"error": "model larger than RAM; llama-bench cannot run it",
                  "model_gb": model_gb, "ram_gb": ram_gb}]
     rows = []
@@ -180,15 +187,16 @@ def cmd_bench(args, model):
 
 
 def cmd_generate(args, model):
-    """Real end-to-end generation via llama-cli. Prefer `--bench` (llama-bench)
-    for the tok/s number: it is purpose-built, prints a stable table, and has
-    no chat mode to fall into. This mode exists to confirm the model actually
-    produces sensible text, and to exercise speculative decoding."""
-    exe = os.path.join(LLAMA, "llama-cli" + EXE)
+    """End-to-end generation via llama-completion, with --perf timings.
+
+    For a model larger than RAM this is THE measurement on b10437: llama-bench
+    cannot run it (unconditional repack) and llama-cli cannot be scripted (chat
+    loop). llama-completion is the classic binary and does both correctly."""
+    exe = os.path.join(LLAMA, GEN_BIN + EXE)
     prompt = args.prompt
     cmd = [exe, "-m", model, "-t", str(args.threads), "-n", str(args.n_gen),
-           "-c", str(args.ctx), "-ngl", "0", "--no-warmup", "-p", prompt,
-           "--perf"]  # without --perf there is no per-token timing at all
+           "-c", str(args.ctx), "-ngl", "0", "--no-warmup", "-no-cnv",
+           "-p", prompt, "--perf"]  # --perf is off by default; no timings without it
     # Repacking rewrites quantized weights into a SIMD-friendly layout, which
     # needs a full in-RAM copy of the model and defeats mmap. Off by default.
     if not args.repack:
@@ -209,26 +217,41 @@ def cmd_generate(args, model):
         print(f"    draft model: {draft_path}")
 
     print(f">>> generating {args.n_gen} tokens, threads={args.threads}, ctx={args.ctx}")
-    # This build's llama-cli drops into an interactive ">" prompt after the
-    # response even with -no-cnv. Closing stdin makes it exit cleanly instead
-    # of hanging until timeout.
+    # stdin closed defensively: llama-completion exits on its own, but if
+    # someone points GEN_BIN at llama-cli this at least avoids a blocking read.
     rc, out, dt = run(cmd, args.timeout, stdin_eof=True)
 
-    m = CLI_RATE_RE.search(out)
-    pp_rate = float(m.group(1)) if m else None
-    tg_rate = float(m.group(2)) if m else None
+    # Prefer the exact --perf breakdown; fall back to llama-cli's rounded summary.
+    pp = PERF_PROMPT_RE.search(out)
+    ev = PERF_EVAL_RE.search(out)
+    ld = PERF_LOAD_RE.search(out)
+    summary = CLI_RATE_RE.search(out)
+
+    load_s = float(ld.group(1)) / 1000 if ld else None
+    pp_rate = float(pp.group(3)) if pp else (float(summary.group(1)) if summary else None)
+    pp_n = int(pp.group(2)) if pp else None
+    tg_rate = float(ev.group(3)) if ev else (float(summary.group(2)) if summary else None)
+    tg_n = int(ev.group(2)) if ev else None
+    tg_ms = float(ev.group(1)) / tg_n if (ev and tg_n) else None
+
     print(f"    exit {rc} in {dt/60:.1f} min")
-    if m:
-        print(f"    prompt {pp_rate:.2f} t/s | generation {tg_rate:.2f} t/s")
-        if tg_rate == 0.0:
-            print("    (llama-cli rounds to 1 decimal; 0.0 means < 0.05 t/s -- "
-                  "use --bench for a precise figure)")
-    else:
-        print("    no '[ Prompt: X t/s | Generation: Y t/s ]' line found; tail:")
+    if load_s is not None:
+        print(f"    load          : {load_s:8.1f} s   (mmap + first-touch of the hot set)")
+    if pp_rate is not None:
+        n = f" over {pp_n} tokens" if pp_n else ""
+        print(f"    prompt eval   : {pp_rate:8.3f} tok/s{n}")
+    if tg_rate is not None:
+        n = f" over {tg_n} tokens" if tg_n else ""
+        per = f"  ({tg_ms/1000:.2f} s/token)" if tg_ms else ""
+        print(f"    GENERATION    : {tg_rate:8.3f} tok/s{n}{per}   <-- the number")
+    if pp_rate is None and tg_rate is None:
+        print("    no perf timings found in output; tail:")
         print("\n".join(out.strip().splitlines()[-20:]))
-    return {"mode": "generate", "threads": args.threads, "ctx": args.ctx,
-            "n_gen": args.n_gen, "draft_model": draft_path, "exit": rc,
-            "wall_s": dt, "prompt_tok_s": pp_rate, "gen_tok_s": tg_rate,
+    return {"mode": "generate", "binary": GEN_BIN, "threads": args.threads,
+            "ctx": args.ctx, "n_gen": args.n_gen, "draft_model": draft_path,
+            "exit": rc, "wall_s": dt, "load_s": load_s,
+            "prompt_tok_s": pp_rate, "prompt_n": pp_n,
+            "gen_tok_s": tg_rate, "gen_n": tg_n, "gen_ms_per_tok": tg_ms,
             "tail": out[-4000:]}
 
 
@@ -251,7 +274,7 @@ def main():
                          "load the whole model into RAM and cannot run a model "
                          "larger than RAM -- they are not a 'no cache' bracket.")
     ap.add_argument("--generate", action="store_true",
-                    help="run llama-cli for real text (default: llama-bench for tok/s)")
+                    help="run llama-completion with --perf (the measurement for models > RAM)")
     ap.add_argument("--draft", action="store_true",
                     help=f"speculative decoding; finds a GGUF matching "
                          f"'{DEFAULT_DRAFT_PATTERN}' unless --draft-model is given")
@@ -277,10 +300,10 @@ def main():
         print("Still downloading? Use --list to see what is present, or pass --model PATH.")
         return 1
 
-    exe_check = os.path.join(LLAMA, ("llama-cli" if args.generate else "llama-bench") + EXE)
+    exe_check = os.path.join(LLAMA, (GEN_BIN if args.generate else "llama-bench") + EXE)
     if not os.path.exists(exe_check):
         print(f"llama.cpp binary not found: {exe_check}")
-        print("Set MINILLM_LLAMA_BIN to the directory containing llama-cli / llama-bench.")
+        print("Set MINILLM_LLAMA_BIN to the directory containing llama-completion / llama-bench.")
         return 1
 
     size = os.path.getsize(model)

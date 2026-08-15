@@ -260,24 +260,31 @@ for exactly these (`MINILLM_MODEL_PATTERN` / `MINILLM_DRAFT_PATTERN` override
 it), and for a split model it correctly picks shard `00001` — which is *not* the
 largest file, so do not point `--model` at the biggest shard by hand.
 
-**7a. The tok/s number — `llama-cli --perf`.** This is the measurement:
+**7a. The tok/s number — `llama-completion --perf`.** This is the measurement:
 
 ```bash
 python bench/llama_baseline.py --generate --threads "$(nproc)" --n-gen 32
 ```
 
-> Why not `llama-bench`? On llama.cpp b10437, `llama-bench` **cannot run a
-> model larger than RAM** — it repacks weights unconditionally (no
-> `--no-repack` flag, ignores `LLAMA_ARG_REPACK`) and dies trying to allocate
-> the whole model. The harness refuses to invoke it for oversized models and
-> says so. `llama-cli` honors `--no-repack`, so `--generate` is the path.
-> (If a future llama.cpp adds `--no-repack` to `llama-bench`, `--quick` gives
-> a cleaner table; check `llama-bench --help | grep repack`.)
+> **Why `llama-completion` and not `llama-bench` or `llama-cli`?** On llama.cpp
+> b10437, both of the obvious tools fail for a model larger than RAM, and both
+> failures are silent-ish:
+> - `llama-bench` repacks weights **unconditionally** — no `--no-repack` flag,
+>   ignores `LLAMA_ARG_REPACK` — and dies allocating the whole model. The
+>   harness refuses to invoke it for oversized models and says why.
+> - `llama-cli` is now a chat frontend. It ignores `-no-cnv`, prints only a
+>   rounded `[ Prompt: X t/s | Generation: Y t/s ]`, and on EOF from stdin it
+>   prints `>` and **loops forever** instead of exiting (one log here reached
+>   46,000 prompt lines). Unusable for scripting.
+>
+> `llama-completion` is the classic non-chat binary: honors `--no-repack` and
+> `-no-cnv`, exits when done, and with `--perf` prints the real breakdown.
+> The harness uses it. All three binaries are in `build/bin/` after Step 4.
 
-The harness passes `--perf`, so `llama-cli` prints per-token timings on top of
-its `[ Prompt: X t/s | Generation: Y t/s ]` summary. **Generation** is the
-number that matters. The first run is cold — the page cache is empty and every
-expert comes from NVMe — so run it twice and read the second. Result lands in
+With `--perf` you get `llama_perf_context_print` lines: **load time**, **prompt
+eval** (tok/s over the prompt), and **eval** (tok/s during generation — *the*
+number). The first run is cold — the page cache is empty and every expert comes
+from NVMe — so run it twice and read the second. Result lands in
 `results/baseline_gen_<hostname>.json`.
 
 **7b. Speculative decoding — add the MTP draft:**
@@ -300,12 +307,10 @@ running without speculation, so the two runs are never accidentally identical.
 Compare `Generation: X t/s` between them. MTP is the single largest lever on this
 machine — expect a meaningful improvement if the draft accepts well.
 
-> **Two things to know about this build's `llama-cli`.** It is a chat frontend
-> and prints `[ Prompt: X t/s | Generation: Y t/s ]` after each turn — rounded to
-> one decimal, so `0.0` means "under 0.05". Use 7a for a precise figure. And it
-> drops into an interactive `>` prompt after the response even with `-no-cnv`;
-> the harness closes stdin so it exits cleanly, but if you run `llama-cli` by
-> hand and it appears to hang, it is waiting for you to type.
+> **If you run `llama-cli` by hand** (for an interactive chat with the model,
+> which is what it is for now), it prints `[ Prompt: X t/s | Generation: Y t/s ]`
+> rounded to one decimal — `0.0` means "under 0.05" — and stays at a `>` prompt
+> waiting for you. Type `/exit` to leave. Do not script it.
 
 > **Whether an MTP-ONLY GGUF loads via `-md` is unverified.** `-md` expects a
 > standalone draft model with its own embeddings and trunk. The `a4lg` MTP-ONLY
@@ -376,7 +381,7 @@ scratch buffers.
 **Download restarts from zero** — `HF_HUB_CACHE` changed between runs. Make sure
 the `export`s are in `~/.bashrc` and sourced.
 
-**`llama-cli: command not found` from the harness** — `MINILLM_LLAMA_BIN` not
+**`llama-completion: command not found` from the harness** — `MINILLM_LLAMA_BIN` not
 set or not exported. `echo $MINILLM_LLAMA_BIN` should print the build dir.
 
 ---
