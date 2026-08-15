@@ -1,0 +1,167 @@
+name: ci
+
+# The Linux target machine is not available to the author, so GitHub's Ubuntu
+# runners are where install.sh / run.sh actually get executed. Every push runs
+# the real installer end-to-end (minus the 630 GB download), builds llama.cpp,
+# calibrates the runner, and then proves run.sh + the harness on a small model
+# that fits in the runner's RAM. If this is green, the Linux path works.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- lint
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck install.sh run.sh
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning -e SC1091 install.sh run.sh
+      - name: python compiles
+        run: python3 -m py_compile bench/*.py scripts/*.py sim/*.py minillm/*.py
+      - name: capacity planner runs (no downloads)
+        run: |
+          python3 -m pip install -q numpy
+          python3 -m minillm.capacity report --machine laptop-i5-8350u --model gpt-oss-120b
+          python3 -m minillm.capacity solve --machine server-32gb-nvme --model qwen3.8-2.4t-a95b --target 1.0
+          python3 -m minillm.capacity frontier --machine server-32gb-nvme
+      - name: cache simulator runs (synthetic trace)
+        run: python3 sim/cache_sim.py --synthetic --model gpt-oss-120b --machine laptop-i5-8350u --tokens 60
+
+  # ---------------------------------------------------------------- installer
+  install-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MINILLM_DIR: ${{ github.workspace }}
+      MINILLM_DATA: /tmp/minillm
+      MINILLM_SKIP_DOWNLOAD: "1"
+      MINILLM_SKIP_TUNING: "1"
+      MINILLM_YES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: runner facts
+        run: |
+          nproc; free -h; df -h /tmp | tail -1
+          grep -m1 -o -E 'avx512[a-z_]*|avx2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+
+      - name: cache llama.cpp build
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/llama.cpp
+          key: llamacpp-${{ runner.os }}-${{ hashFiles('install.sh') }}-v1
+
+      # First run: everything from a cold machine. This is exactly what the
+      # user's `curl | bash` does, minus the model download and sudo prompts.
+      - name: install.sh (first run, cold)
+        run: bash install.sh
+
+      # Second run must be fast and change nothing. This proves the
+      # "safe to re-run" promise -- every step must skip itself.
+      - name: install.sh (second run, must be idempotent)
+        run: |
+          before=$(md5sum ~/.bashrc)
+          time bash install.sh 2>&1 | tee /tmp/second.log
+          after=$(md5sum ~/.bashrc)
+          [ "$before" = "$after" ] || { echo "::error::second run changed ~/.bashrc"; exit 1; }
+          # every step should report skip, none should rebuild
+          ! grep -qE "compiling with|installing:|cloned to|venv created" /tmp/second.log \
+            || { echo "::error::second run redid work it should have skipped"; exit 1; }
+          echo "idempotent: yes"
+
+      - name: what install.sh left behind
+        run: |
+          echo "--- bashrc block ---"; sed -n '/# >>> MiniLLM >>>/,/# <<< MiniLLM <<</p' ~/.bashrc
+          echo "--- llama.cpp ---"; ~/llama.cpp/build/bin/llama-completion --version 2>&1 | head -2
+          ~/llama.cpp/build/bin/llama-completion --help 2>&1 | grep -q -- '--no-repack' && echo "--no-repack: yes"
+          ~/llama.cpp/build/bin/llama-cli --help 2>&1 | grep -q -- '--spec-type' && echo "--spec-type on llama-cli: yes"
+          echo "--- roofline ---"; cat results/roofline_*.txt | tail -12
+
+      # gpt-oss-20b: the smallest official MoE GGUF that ships with an EAGLE3
+      # draft (12.1 GB main + 0.9 GB draft). Same family as the laptop baseline.
+      # It fits the runner's RAM, so this exercises exactly the run.sh code
+      # path the 630 GB model takes -- HF-cache symlink discovery,
+      # llama-completion --no-repack --perf, and llama-cli -st for --draft.
+      - name: fetch gpt-oss-20b + EAGLE3 draft
+        env:
+          HF_HOME: /tmp/minillm/hf
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+        run: |
+          source .venv/bin/activate
+          python scripts/fetch_model.py --repo ggml-org/gpt-oss-20b-GGUF \
+            --files gpt-oss-20b-MXFP4.gguf eagle3-gpt-oss-20b-Q8_0.gguf --workers 4
+          python bench/llama_baseline.py --list
+          df -h /tmp | tail -1
+
+      - name: run.sh end-to-end on Linux
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          set -o pipefail
+          bash run.sh -n 8 -p "The capital of France is" 2>&1 | tee /tmp/run.log
+          grep -E "eval time" /tmp/run.log || { echo "::error::no --perf timings; run.sh did not complete a generation"; exit 1; }
+          grep -qi "paris" /tmp/run.log && echo "model answered correctly" || echo "::warning::no 'Paris' in output"
+
+      - name: run.sh --draft on Linux (llama-cli -st + EAGLE3)
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          set -o pipefail
+          # run.sh looks for *MTP-ONLY* by default; point it at the EAGLE3 draft
+          # by exercising the harness path instead, which takes --draft-model.
+          source .venv/bin/activate
+          D=$(find -L /tmp/minillm/hf/hub -path '*/snapshots/*' -name 'eagle3-*.gguf' | head -1)
+          timeout 900 python bench/llama_baseline.py --generate --draft-model "$D" \
+            --threads "$(nproc)" --n-gen 8 --ctx 512 --timeout 800 2>&1 | tee /tmp/draft.log
+          grep -qE "Prompt:.*Generation:|eval time" /tmp/draft.log \
+            || { echo "::error::draft run produced no timings -- llama-cli -st did not exit cleanly?"; exit 1; }
+          echo "draft path exits cleanly: yes"
+
+      - name: harness --generate on Linux
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          source .venv/bin/activate
+          python bench/llama_baseline.py --generate --threads "$(nproc)" --n-gen 8 --ctx 512 --timeout 900
+          python -c "import json,glob; d=json.load(open(glob.glob('results/baseline_gen_*.json')[0])); print({k:d[k] for k in ('binary','gen_tok_s','prompt_tok_s','load_s','exit')})"
+
+      - name: harness --draft with no draft file must refuse cleanly
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_DRAFT_PATTERN: does-not-exist
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          source .venv/bin/activate
+          set +e
+          python bench/llama_baseline.py --generate --draft --n-gen 4 --timeout 60; rc=$?
+          set -e
+          [ $rc -ne 0 ] && echo "correctly refused (exit $rc)" || { echo "::error::--draft ran without a draft file"; exit 1; }
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_number }}
+          path: |
+            results/
+            /tmp/run.log
+            /tmp/second.log
+          if-no-files-found: ignore

@@ -192,11 +192,18 @@ def cmd_generate(args, model):
     For a model larger than RAM this is THE measurement on b10437: llama-bench
     cannot run it (unconditional repack) and llama-cli cannot be scripted (chat
     loop). llama-completion is the classic binary and does both correctly."""
-    exe = os.path.join(LLAMA, GEN_BIN + EXE)
+    # Speculative decoding lives only in llama-cli / llama-server on b10437;
+    # llama-completion has none of the --spec-* flags. llama-cli normally loops
+    # forever on stdin EOF, but -st (single-turn) makes it answer once and exit
+    # -- verified. So: draft runs use llama-cli -st, plain runs llama-completion.
+    use_draft = bool(args.draft or args.draft_model)
+    binary = "llama-cli" if use_draft else GEN_BIN
+    exe = os.path.join(LLAMA, binary + EXE)
     prompt = args.prompt
     cmd = [exe, "-m", model, "-t", str(args.threads), "-n", str(args.n_gen),
-           "-c", str(args.ctx), "-ngl", "0", "--no-warmup", "-no-cnv",
-           "-p", prompt, "--perf"]  # --perf is off by default; no timings without it
+           "-c", str(args.ctx), "-ngl", "0", "--no-warmup", "-p", prompt,
+           "--perf"]  # --perf is off by default; no timings without it
+    cmd += ["-st"] if use_draft else ["-no-cnv"]
     # Repacking rewrites quantized weights into a SIMD-friendly layout, which
     # needs a full in-RAM copy of the model and defeats mmap. Off by default.
     if not args.repack:
@@ -214,6 +221,13 @@ def cmd_generate(args, model):
             return {"mode": "generate", "exit": 2, "error": "draft model not found"}
         # b10437 flag names. --draft-max/--draft-min were REMOVED upstream.
         cmd += ["-md", draft_path, "--spec-draft-n-max", "4", "--spec-draft-n-min", "1"]
+        # An MTP-ONLY GGUF (a4lg/*-MTP-ONLY-GGUF) is not a standalone draft
+        # model -- it is the target model's own multi-token-prediction head,
+        # and llama.cpp must be told so or it will try to run it as a full
+        # model and fail. Per the a4lg README: --spec-type draft-mtp.
+        # A conventional draft (EAGLE3, a small full model) must NOT get this.
+        if "mtp" in os.path.basename(draft_path).lower():
+            cmd += ["--spec-type", "draft-mtp"]
         print(f"    draft model: {draft_path}")
 
     print(f">>> generating {args.n_gen} tokens, threads={args.threads}, ctx={args.ctx}")
@@ -247,7 +261,7 @@ def cmd_generate(args, model):
     if pp_rate is None and tg_rate is None:
         print("    no perf timings found in output; tail:")
         print("\n".join(out.strip().splitlines()[-20:]))
-    return {"mode": "generate", "binary": GEN_BIN, "threads": args.threads,
+    return {"mode": "generate", "binary": binary, "threads": args.threads,
             "ctx": args.ctx, "n_gen": args.n_gen, "draft_model": draft_path,
             "exit": rc, "wall_s": dt, "load_s": load_s,
             "prompt_tok_s": pp_rate, "prompt_n": pp_n,

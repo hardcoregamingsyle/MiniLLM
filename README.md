@@ -4,14 +4,44 @@ CPU inference for Mixture-of-Experts models far larger than RAM, streaming
 experts from disk. The bet: **a router-aware expert cache beats the OS page
 cache**, because the OS evicts 4 KB pages by LRU and has no idea what a router is.
 
-**Setting up the Linux target machine? Start with [SETUP_LINUX.md](SETUP_LINUX.md).**
-It is a copy-paste sequence: system packages → clone → start the 630 GB download
-→ build llama.cpp for your CPU → calibrate → first run.
+## Quick start (Linux Mint / Ubuntu / Debian)
+
+One command does the whole setup — packages, clone, Python env, HF token,
+llama.cpp built for your CPU, hardware calibration, and the 630 GB model
+download started in a `tmux` session:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hardcoregamingsyle/MiniLLM/main/install.sh | bash
+```
+
+It asks before anything needing `sudo`, is **safe to re-run** (each step skips
+itself if already done, the download resumes), and stops with a clear message
+on the first failure. Then, once the download finishes:
+
+```bash
+cd ~/MiniLLM
+bash run.sh                # generate 32 tokens, print tok/s
+bash run.sh --draft        # same, with MTP speculative decoding
+bash run.sh --chat         # talk to the model
+```
+
+Options are env vars: `MINILLM_DATA=/mnt/big` (where the 630 GB goes),
+`MINILLM_QUANT=UD-IQ2_XS` (larger, better quality), `MINILLM_SKIP_DOWNLOAD=1`,
+`MINILLM_YES=1` (unattended). Prefer to see every step? The same sequence,
+explained, is in **[SETUP_LINUX.md](SETUP_LINUX.md)**.
+
+`run.sh` knows things that cost a day to learn: it uses `llama-completion`
+(not `llama-cli`, which is now a chat loop, nor `llama-bench`, which cannot run
+a model larger than RAM), passes `--no-repack` (mandatory above RAM, not the
+default), finds shard `00001` of a split GGUF through the Hugging Face cache's
+symlinks, and refuses to start until the last shard exists.
 
 ## What is in here
 
 | Path | What it does |
 | --- | --- |
+| **`install.sh`** | One-shot Linux setup: packages → clone → venv → token → build llama.cpp → calibrate → start download. Idempotent. |
+| **`run.sh`** | Day-to-day runner: finds the model, picks the right binary and flags, runs it. `--draft`, `--chat`. |
 | `bench/roofline.py` | Measures DRAM, disk, and dequant bandwidth on any machine. Windows + Linux. |
 | `minillm/capacity.py` | Predicts tok/s for any (machine × model × quantization). `report`, `solve`, `frontier`. |
 | `minillm/machines.json` | Machine profiles — paste roofline output here to add a machine. |
