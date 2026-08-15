@@ -141,7 +141,15 @@ jobs:
         run: |
           source .venv/bin/activate
           python bench/llama_baseline.py --generate --threads "$(nproc)" --n-gen 8 --ctx 512 --timeout 900
-          python -c "import json,glob; d=json.load(open(glob.glob('results/baseline_gen_*.json')[0])); print({k:d[k] for k in ('binary','gen_tok_s','prompt_tok_s','load_s','exit')})"
+          # results/ also holds the committed laptop result (different schema);
+          # read the file THIS runner just wrote, by hostname.
+          python - <<'EOF'
+          import json, os, platform
+          host = platform.node().split(".")[0].lower()
+          d = json.load(open(f"results/baseline_gen_{host}.json"))
+          print({k: d.get(k) for k in ("binary", "gen_tok_s", "prompt_tok_s", "load_s", "exit")})
+          assert d.get("exit") == 0 and d.get("gen_tok_s"), "harness did not record a successful generation"
+          EOF
 
       - name: harness --draft with no draft file must refuse cleanly
         env:
