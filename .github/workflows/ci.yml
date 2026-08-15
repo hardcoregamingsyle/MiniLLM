@@ -128,8 +128,9 @@ jobs:
           D=$(find -L /tmp/minillm/hf/hub -path '*/snapshots/*' -name 'eagle3-*.gguf' | head -1)
           timeout 900 python bench/llama_baseline.py --generate --draft-model "$D" \
             --threads "$(nproc)" --n-gen 8 --ctx 512 --timeout 800 2>&1 | tee /tmp/draft.log
-          grep -qE "Prompt:.*Generation:|eval time" /tmp/draft.log \
-            || { echo "::error::draft run produced no timings -- llama-cli -st did not exit cleanly?"; exit 1; }
+          # The harness reformats timings; assert on ITS output, not raw llama.cpp text.
+          grep -qE "GENERATION\s*:\s*[0-9.]+ tok/s" /tmp/draft.log \
+            || { echo "::error::draft run produced no GENERATION line -- llama-cli -st did not exit cleanly?"; exit 1; }
           echo "draft path exits cleanly: yes"
 
       - name: harness --generate on Linux
