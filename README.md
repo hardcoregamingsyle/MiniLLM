@@ -22,10 +22,10 @@ It is a copy-paste sequence: system packages → clone → start the 630 GB down
 | `bench/llama_baseline.py` | Drives llama.cpp for the baseline tok/s measurement. |
 | `ARCHITECTURE.md` | The full derivation from Qwen3.8-2.4T's `config.json`. |
 
-The current state is **calibration and planning**: measured hardware constants,
-exact parameter decompositions, a capacity model, and a cache simulator. The
-custom runtime (`runtime/`) is not started; the llama.cpp baseline it must beat
-is being measured now.
+The current state is **baseline measured, runtime not started**. gpt-oss-120b
+runs correctly on the 8 GB laptop at 0.05–0.08 tok/s, and the profile of *why*
+it is that slow (page-fault-bound mmap, three idle cores) is the specification
+for the first thing `runtime/` should build. See "The baseline result" below.
 
 ## Measured roofline (the 8 GB dev laptop)
 
@@ -269,14 +269,59 @@ amortization multiplier; `--draft` wires it in via `-md` with
 build). The draft cannot load standalone — it needs the target model's
 embeddings — so it only runs alongside the main model.
 
-**First real number.** The very first end-to-end run of gpt-oss-120b on this
-laptop (llama-cli, 4 threads, cold page cache, before the harness fixes above)
-printed `[ Prompt: 0.1 t/s | Generation: 0.0 t/s ]` — prompt processing at
-one token every ~10 s, generation below the display's 0.05 t/s floor. That is
-roughly **10–20x slower than `capacity.py` predicted at a 70% hit rate**. Whether
-that gap is cold-cache warmup, a hit rate far below 70%, or the un-repacked AVX2
-kernel being much slower than the 6 GB/s estimate is exactly what the runs in
-`results/` are for. It is the first data point, not the verdict.
+## The baseline result, and what it actually measures
+
+gpt-oss-120b (59 GB MXFP4) on the 8 GB laptop, `llama-completion --perf`,
+4 threads, mmap. Two consecutive runs; full data in
+`results/baseline_gen_hackintosh.json`:
+
+| Run | Cache | Prompt eval | **Generation** | Output |
+| --- | --- | --- | --- | --- |
+| 1 | cold | 12.7 s/tok | **19.7 s/tok = 0.05 tok/s** | "The capital of France is Paris." |
+| 2 | warm | 7.2 s/tok | **12.9 s/tok = 0.08 tok/s** | |
+
+The model runs and is correct. It is also **~12–19x slower than `capacity.py`
+predicted** at a 70% hit rate — and, more tellingly, **3–5x slower than the
+model's zero-hit-rate disk floor** (3.49 s/token). Neither cache hit rate nor
+disk bandwidth can explain that. So something the model did not account for is
+binding. Sampling the OS during generation found it:
+
+| Counter during generation | Value |
+| --- | --- |
+| Disk read | 264–326 MB/s (SSD max: 510) |
+| Pages input | **67k–83k / s** — × 4 KB = 262–326 MB/s |
+| Hard page faults | 95k–181k / s |
+| Available RAM | 68–136 MB |
+| llama-completion CPU | **83–118% of 400%** — 3 of 4 cores idle |
+
+Every byte of I/O arrives as an individual **4 KB hard page fault**. The page
+cache (~2.5 GB after the process's own working set) is smaller than one
+token's 3.27 GB of demand, so each token evicts most of the previous token's
+experts, and mmap re-faults them one page at a time. The fault handler
+saturates at ~300 MB/s — 59% of what the SSD can deliver — while three cores
+wait. `3.27 GB ÷ 0.30 GB/s = 10.9 s/token` predicted from that mechanism alone;
+measured 12.9–19.7. **The run is page-fault-bound**: not compute, not device.
+
+Two consequences, one deflating and one encouraging:
+
+- **The 8 GB laptop cannot test the *cache* thesis** (routing-aware vs LRU).
+  With capacity below one token's working set there is nothing to cache — every
+  policy degenerates to "reload everything". `sim/cache_sim.py`'s laptop
+  scenario assumed 1.4 tokens of cache; the real figure after process overhead
+  is ~0.75. The cache-policy question moves to the 32 GB server.
+- **It is a clean test of the *loader* thesis**, and the loader thesis just got
+  much stronger. `capacity.py` assumed the disk delivers at device bandwidth in
+  large blocks. It does not, through mmap: it delivers 4 KB at a time through a
+  fault handler, and that costs 40% of bandwidth and 3 cores. An expert loader
+  that reads whole 13 MB experts with a handful of large overlapped / `O_DIRECT`
+  reads — instead of faulting 3,300 pages each — should approach 510 MB/s
+  *and* free the cores to compute. On this exact laptop that is worth **~1.7x
+  from bandwidth alone**, before any caching. That is the first thing
+  `runtime/` should build, and this measurement is its before-picture.
+
+The 32 GB / NVMe server has 6.7x the disk bandwidth and ~10x the cache; whether
+its mmap path is fault-bound too is the first thing to measure there
+(SETUP_LINUX.md step 7 does it). If it is, the loader wins on both machines.
 
 ## Where the thesis actually lives
 

@@ -1,0 +1,49 @@
+{
+  "host": "hackintosh",
+  "platform": "win32",
+  "binary": "llama-completion (llama.cpp b10437, ggml-cpu-haswell / AVX2)",
+  "model": "gpt-oss-120b-MXFP4.gguf (ggml-org), 59.03 GB",
+  "cmd": "-t 4 -n 12 -c 512 -ngl 0 --no-warmup --no-repack --perf -no-cnv -lm mmap",
+  "cache_state": "cold (first run after process start; page cache had prior partial warmth from earlier attempts)",
+  "load_s": 63.40546,
+  "prompt_tokens": 5,
+  "prompt_ms_per_tok": 12680.0,
+  "prompt_tok_s": 0.08,
+  "gen_tokens": 11,
+  "gen_ms_per_tok": 19678.16,
+  "gen_tok_s": 0.05,
+  "total_s": 280.25553,
+  "output_text": "The capital of France is Paris.\" If you",
+  "notes": [
+    "First successful end-to-end generation of gpt-oss-120b on an 8 GB laptop. Output: 'The capital of France is Paris.'",
+    "This is exactly the regime where a custom expert loader should win: read whole 13 MB experts with large O_DIRECT/overlapped reads instead of faulting 3,300 x 4 KB pages each. That alone would move I/O from ~300 MB/s (fault-bound) toward 510 MB/s (device-bound), and stop stalling 3 cores.",
+    "The 8 GB laptop is not a fair test of the cache THESIS (routing-aware vs LRU) because capacity is below one token's working set -- there is nothing to cache. It IS a fair test of the LOADER thesis (bulk expert reads vs 4 KB mmap faults)."
+  ],
+  "runs": [
+    {
+      "run": 1,
+      "cache": "cold",
+      "prompt_ms_per_tok": 12680.0,
+      "gen_ms_per_tok": 19678.2,
+      "gen_tok_s": 0.05,
+      "n_gen": 11
+    },
+    {
+      "run": 2,
+      "cache": "warm (right after run 1)",
+      "prompt_ms_per_tok": 7231.8,
+      "gen_ms_per_tok": 12855.2,
+      "gen_tok_s": 0.08,
+      "n_gen": 5
+    }
+  ],
+  "disk_probe_during_gen": {
+    "disk_read_MBps": "264-326 sustained (SSD max 510)",
+    "pages_input_per_s": "67k-83k  (x 4 KB = 262-326 MB/s: ALL I/O arrives as 4 KB hard faults)",
+    "hard_page_faults_per_s": "95k-181k",
+    "available_RAM_MB": "68-136",
+    "llama_cpu_pct_of_400": "83-118  (3 of 4 cores idle, blocked on faults)",
+    "csv": "results/disk_probe.csv"
+  },
+  "diagnosis": "PAGE-FAULT-BOUND, not compute-bound and not device-bound. The page cache (~2.5 GB after the process's own working set) is smaller than one token's 3.27 GB demand, so every token evicts most of the previous token's experts. mmap then re-faults them in 4 KB units at ~75k faults/s, which saturates the fault handler at ~300 MB/s -- 59% of the SSD's 510 MB/s -- while 3 of 4 cores sit idle. 3.27 GB / 0.30 GB/s = 10.9 s/token predicted vs 12.9-19.7 measured. capacity.py assumed I/O at device bandwidth in large blocks; that assumption is what was wrong."
+}

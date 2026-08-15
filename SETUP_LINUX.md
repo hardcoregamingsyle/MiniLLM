@@ -281,11 +281,32 @@ python bench/llama_baseline.py --generate --threads "$(nproc)" --n-gen 32
 > `-no-cnv`, exits when done, and with `--perf` prints the real breakdown.
 > The harness uses it. All three binaries are in `build/bin/` after Step 4.
 
-With `--perf` you get `llama_perf_context_print` lines: **load time**, **prompt
-eval** (tok/s over the prompt), and **eval** (tok/s during generation — *the*
-number). The first run is cold — the page cache is empty and every expert comes
-from NVMe — so run it twice and read the second. Result lands in
+With `--perf` you get `common_perf_print` lines: **load time**, **prompt eval**
+(tok/s over the prompt), and **eval** (tok/s during generation — *the* number).
+The first run is cold — the page cache is empty and every expert comes from
+NVMe — so run it twice and read the second. Result lands in
 `results/baseline_gen_<hostname>.json`.
+
+**While it generates, sample the OS in a second terminal.** On the 8 GB laptop
+this is what exposed the real bottleneck (page-fault-bound mmap, three of four
+cores idle — see README "The baseline result"). The same three numbers decide
+whether the server has the same problem:
+
+```bash
+# in a second terminal, while 7a is generating (not loading):
+vmstat 3 10          # columns: bi = KB/s read in; us/sy/id = CPU user/sys/idle
+```
+
+Read it as: `bi × 1024` vs your NVMe's measured bandwidth from Step 5, and
+`id` (idle %) with all cores counted. If `bi` is well below the NVMe figure
+*and* idle is high, the run is fault-bound like the laptop — the kernel is
+serving mmap in 4 KB pages faster than the CPU can fault them, and a bulk
+expert loader would win. If `bi` sits near the NVMe figure, it is genuinely
+disk-bound and only caching helps. If idle is near 0, it is compute-bound and
+the dequant kernel is the wall. Note which one; it decides what to build next.
+
+For per-process faults specifically: `pidstat -r -p "$(pgrep llama-completion)" 3`
+(package `sysstat`) — the `majflt/s` column is hard faults per second.
 
 **7b. Speculative decoding — add the MTP draft:**
 
