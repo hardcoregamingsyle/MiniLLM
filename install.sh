@@ -190,10 +190,16 @@ else
   fi
   cd "$LLAMA_DIR"
   # -DGGML_NATIVE=ON: compile for exactly this CPU (AVX-512 if present).
-  cmake -B build -G Ninja -DGGML_NATIVE=ON -DGGML_LTO=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=ON \
+  cmake -B build -G Ninja -DGGML_NATIVE=ON -DGGML_LTO=ON -DCMAKE_BUILD_TYPE=Release \
         -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON >/dev/null || die "cmake configure failed"
   printf '    compiling with %s jobs (a few minutes)...\n' "$CORES"
-  cmake --build build --config Release -j"$CORES" 2>&1 | grep -E "error|Error" && die "llama.cpp build failed" || true
+  # Trust the exit code, never grep for "error": a successful build prints
+  # filenames like _error.svelte.js and would be killed by a text match.
+  # Quiet on success, full log on failure.
+  if ! cmake --build build --config Release -j"$CORES" > "$LLAMA_DIR/build.log" 2>&1; then
+    tail -40 "$LLAMA_DIR/build.log"
+    die "llama.cpp build failed (full log: $LLAMA_DIR/build.log)"
+  fi
   [[ -x build/bin/llama-completion ]] || die "build finished but llama-completion is missing"
   ok "built: $(build/bin/llama-completion --version 2>&1 | head -1)"
   cd "$MINILLM_DIR"
