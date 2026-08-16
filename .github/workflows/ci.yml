@@ -98,8 +98,10 @@ jobs:
           [ $rc -ne 0 ] && grep -q "Unknown MINILLM_MODEL" <<<"$out" \
             && echo "bad model name rejected: yes (exit $rc)" \
             || { echo "::error::MINILLM_MODEL=nope was not rejected (rc=$rc)"; exit 1; }
-          # put the default back for the steps below
-          bash install.sh >/dev/null 2>&1
+          # Put the default back for the steps below. The step's env: pins
+          # MINILLM_MODEL=qwen3.8-2.4t for EVERY command here, so unset it
+          # explicitly or this "restore" re-selects the 2.4T.
+          env -u MINILLM_MODEL bash install.sh >/dev/null 2>&1
           grep -q 'MINILLM_MODEL_PATTERN="Qwen3.5-397B-A17B-UD-Q4_K_XL"' ~/.bashrc \
             && echo "default restored: yes" \
             || { echo "::error::default model pattern not restored"; exit 1; }
