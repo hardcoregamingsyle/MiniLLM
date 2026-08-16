@@ -21,7 +21,7 @@ if [[ -z "${MINILLM_LLAMA_BIN:-}" && -f "$HOME/.bashrc" ]]; then
 fi
 BIN="${MINILLM_LLAMA_BIN:-$HOME/llama.cpp/build/bin}"
 CACHE="${HF_HUB_CACHE:-${HF_HOME:-$HOME/minillm/hf}/hub}"
-PATTERN="${MINILLM_MODEL_PATTERN:-Qwen3.8-2.4T-A95B-UD-IQ2_XXS}"
+PATTERN="${MINILLM_MODEL_PATTERN:-Qwen3.5-397B-A17B-UD-Q4_K_XL}"
 THREADS="${MINILLM_THREADS:-$(nproc)}"
 
 mode=bench; draft=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
@@ -44,6 +44,18 @@ done
 findgguf() { find -L "$CACHE" -path '*/snapshots/*' -type f -name "$1" 2>/dev/null | sort | head -1 || true; }
 model=$(findgguf "*${PATTERN}*-00001-of-*.gguf")
 [[ -n "$model" ]] || model=$(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*${PATTERN}*.gguf" ! -name "*-of-*" 2>/dev/null | sort | head -1 || true)
+# Pattern missed? If exactly one split model (excluding MTP drafts) is present,
+# use it -- the common case after install.sh with any MINILLM_MODEL.
+if [[ -z "$model" ]]; then
+  mapfile -t firsts < <(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*-00001-of-*.gguf" ! -iname "*MTP-ONLY*" 2>/dev/null | sort)
+  if [[ ${#firsts[@]} -eq 1 ]]; then
+    model="${firsts[0]}"; echo "note   : pattern '$PATTERN' not found; using the only model present"
+  elif [[ ${#firsts[@]} -gt 1 ]]; then
+    echo "Several models present; pick one with MINILLM_MODEL_PATTERN=<substring>:" >&2
+    printf '  %s
+' "${firsts[@]##*/}" >&2; exit 1
+  fi
+fi
 if [[ -z "$model" ]]; then
   echo "No GGUF matching '$PATTERN' under $CACHE" >&2
   echo "Still downloading?  tmux attach -t minillm-dl" >&2

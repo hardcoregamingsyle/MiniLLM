@@ -70,7 +70,7 @@ def find_gguf(pattern):
 
 # Per-machine defaults. Override with --model / --draft-model, or these env vars.
 DEFAULT_MODEL_PATTERN = os.environ.get("MINILLM_MODEL_PATTERN") or (
-    "gpt-oss-120b-MXFP4" if IS_WIN else "Qwen3.8-2.4T-A95B-UD-IQ2_XXS")
+    "gpt-oss-120b-MXFP4" if IS_WIN else "Qwen3.5-397B-A17B-UD-Q4_K_XL")
 DEFAULT_DRAFT_PATTERN = os.environ.get("MINILLM_DRAFT_PATTERN") or (
     "eagle3" if IS_WIN else "MTP-ONLY")
 

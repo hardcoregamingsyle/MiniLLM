@@ -9,8 +9,8 @@ cache**, because the OS evicts 4 KB pages by LRU and has no idea what a router i
 ## Quick start (Linux Mint / Ubuntu / Debian)
 
 One command does the whole setup — packages, clone, Python env, HF token,
-llama.cpp built for your CPU, hardware calibration, and the 630 GB model
-download started in a `tmux` session. **Every push runs this exact installer
+llama.cpp built for your CPU, hardware calibration, and the model download
+(250 GB default, 680 GB for the 2.4T) started in a `tmux` session. **Every push runs this exact installer
 on a fresh Ubuntu VM** (see the badge): cold install → re-run and assert
 nothing changed → build llama.cpp → calibrate → fetch a 12 GB MoE → prove
 `run.sh`, `--draft`, and the harness end-to-end. Green means the commands
@@ -31,8 +31,9 @@ bash run.sh --draft        # same, with MTP speculative decoding
 bash run.sh --chat         # talk to the model
 ```
 
-Options are env vars: `MINILLM_DATA=/mnt/big` (where the 630 GB goes),
-`MINILLM_QUANT=UD-IQ2_XS` (larger, better quality), `MINILLM_SKIP_DOWNLOAD=1`,
+Options are env vars: `MINILLM_MODEL=qwen3.8-2.4t` (the 2.4T instead of the
+default 397B), `MINILLM_DATA=/mnt/big` (where the model goes), `MINILLM_QUANT=...`,
+`MINILLM_SKIP_DOWNLOAD=1`,
 `MINILLM_YES=1` (unattended). Prefer to see every step? The same sequence,
 explained, is in **[SETUP_LINUX.md](SETUP_LINUX.md)**.
 
@@ -46,7 +47,7 @@ symlinks, and refuses to start until the last shard exists.
 
 | Path | What it does |
 | --- | --- |
-| **`install.sh`** | One-shot Linux setup: packages → clone → venv → token → build llama.cpp → calibrate → start download. Idempotent. |
+| **`install.sh`** | One-shot Linux setup: packages → clone → venv → token → build llama.cpp → calibrate → start download. Idempotent; `MINILLM_MODEL` picks 397B (default) or 2.4T. |
 | **`run.sh`** | Day-to-day runner: finds the model, picks the right binary and flags, runs it. `--draft`, `--chat`. |
 | `bench/roofline.py` | Measures DRAM, disk, and dequant bandwidth on any machine. Windows + Linux. |
 | `minillm/capacity.py` | Predicts tok/s for any (machine × model × quantization). `report`, `solve`, `frontier`. |
@@ -126,58 +127,33 @@ narrow 2880-wide experts. Predicted **0.96 tok/s at native MXFP4**, needing a
 **71.3% expert-cache hit rate**, with the capacity ceiling at 100% — so it is
 purely policy-bound. That is exactly the regime this project exists to test.
 
-### Server (32 GB / 900 GB): Qwen3.8-2.4T-A95B — the confirmed target
+### Server (32 GB / 920 GB, i5-10210U, PCIe 3.0): `Qwen/Qwen3.5-397B-A17B`, not the 2.4T
 
-The 2.4T is the model for the server. Runnable GGUFs exist as of 10 Aug 2026:
-[`unsloth/Qwen3.8-2.4T-A95B-GGUF`](https://hf.co/unsloth/Qwen3.8-2.4T-A95B-GGUF).
-Exact sizes, which decide what 900 GB can hold:
+The target is an **i5-10210U** — 4 cores AVX2, 15 W, and critically **PCIe 3.0
+only**, so the NVMe caps at ~3 GB/s. `capacity.py` with those constants
+(`kernel_gbps` taken from a CI runner with the same core count and SIMD,
+which measured 21.9):
 
-| Quant | Size | Fits 900 GB? | Note |
-| --- | --- | --- | --- |
-| UD-Q1_0 | 370.0 GB | yes | 1-bit; quality unknown |
-| UD-IQ1_S | 473.5 GB | yes | |
-| UD-IQ1_M | 525.2 GB | yes | |
-| **UD-IQ2_XXS** | **611.5 GB** | **yes** | **best quality that fits** |
-| UD-IQ2_XS | 680.5 GB | yes | 219 GB headroom, tighter |
-| UD-IQ3_XXS | 889.9 GB | **no** — 10 GB short after OS/KV | |
-| UD-IQ4_XS | 1220.8 GB | no | |
-| Q8_0 / BF16 | 2.4 / 4.6 TB | no | |
+| Model / quant | Disk | Single | + MTP | Verdict |
+| --- | --- | --- | --- | --- |
+| **Qwen3.5-397B UD-Q4_K_XL** | **245 GB** | **1.6** | **2.8** | **clears the 2 tok/s aim** |
+| Qwen3.8-2.4T UD-IQ2_XXS | 656 GB | 0.72 | 0.48 | misses the 1 tok/s floor |
+| Qwen3.8-2.4T UD-IQ3_XXS | 956 GB | 0.36 | — | **does not fit** (36 GB over) |
+| Qwen3.8-2.4T UD-IQ4_XS | 1,311 GB | 0.13 | — | **does not fit** (411 GB over) |
 
-**900 GB forces ≤ 2-bit experts.** IQ3_XXS misses by ~10 GB once the OS and KV
-cache are accounted for; IQ2_XS is the largest that fits comfortably. UD (Unsloth
-Dynamic) quants keep attention and shared experts at higher precision than the
-routed experts, which is exactly the split `capacity.py` models — so the "hot"
-half is not crushed to 2 bits even in an IQ2 file.
+Two things decide it, both physical. **A 3-bit or 4-bit 2.4T does not fit on
+920 GB** — the sizes above are read from the Hub, not estimated. And **on this
+laptop, more bits on the 2.4T make it slower**: the bottleneck is the PCIe 3.0
+disk feeding 46 B of routed-expert params per token, and every extra bit is
+more bytes through that pipe. IQ2_XXS is both the largest 2.4T that fits and
+the fastest — and it still misses the floor. Note the MTP column flips sign
+for the 2.4T here (0.72 → 0.48): drafting touches more distinct experts than
+a 3 GB/s disk can serve.
 
-Native MTP draft for speculative decoding is also published:
-[`a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF`](https://hf.co/a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF)
-(Q4_K_M 18.5 GB, Q8_0 30.1 GB). Speculation is the biggest single lever on the
-server; the plan is IQ2_XXS main + Q4_K_M MTP draft = **~630 GB total**.
-
-Predicted by `capacity.py` (75% hit rate, MTP at k=3 / 60% acceptance):
-
-| Attention | Experts | Cache | Single | + MTP | Binding |
-| --- | --- | --- | --- | --- | --- |
-| Q4_K_M | IQ2_XXS | 1.8 GB | 0.59 | 0.60 | disk |
-| Q3_K_M | IQ2_XXS | 8.0 GB | 0.78 | 0.87 | kernel |
-| **Q2_K** | **IQ2_XXS** | **12.6 GB** | **0.92** | **1.30** | kernel |
-| Q2_K | IQ1_S | 12.6 GB | 1.03 | 1.68 | kernel |
-
-Two things this settles. First, **attention precision decides more than expert
-precision**: at Q4_K_M attention the cache is 1.8 GB and MTP has nothing to
-amortize (0.59 → 0.60); at Q2_K attention it opens 12.6 GB and MTP is worth
-40%. What precision the downloaded UD-IQ2_XXS file actually uses for attention
-tensors is therefore the first thing to check on the server. Second, honest
-verdict: **the 1 tok/s floor is reachable, the 2 tok/s aim is not** on 32 GB —
-and sweeping RAM in `capacity.py` shows **more RAM does not fix it**: 32 GB →
-1.30, 48 GB → 1.43, 64/96/128 GB → 1.43. It flatlines because above ~48 GB the
-bottleneck is dequant compute, not memory. Reaching 2 tok/s on the 2.4T needs a
-faster kernel, not more DDR4.
-
-For reference, the strongest alternative found on 32 GB is Qwen3.5-397B-A17B
-(1.80 tok/s at Q8_0 attn + Q4_K_M experts, 214 GB) — a much smaller model at
-much better precision. It is not the target; it is what to fall back to if the
-2.4T's IQ2 quality proves unusable.
+The 397B at near-Q8 attention and Q4 experts is a far better model per token
+than the 2.4T at 2 bits, and it is 3–6× faster. `install.sh` defaults to it;
+`MINILLM_MODEL=qwen3.8-2.4t` gets the IQ2_XXS 2.4T for comparison. Both fit
+side by side.
 
 > **Caveat:** most rows are *kernel*-bound — the binding constant is
 > `kernel_gbps: 24`, an estimate never measured on any machine. The laptop

@@ -5,7 +5,7 @@
 #   1. system packages          2. clone MiniLLM + Python venv
 #   3. HF token + cache dirs    4. build llama.cpp for this CPU
 #   5. roofline calibration     6. kernel tuning (optional, asks)
-#   7. start the model download (~630 GB) in a tmux session
+#   7. start the model download (250-680 GB) in a tmux session
 #
 # Safe to re-run: every step checks whether it is already done and skips.
 # If a step fails, the script stops and says which one; fix it and re-run.
@@ -18,8 +18,10 @@
 # Options (env vars):
 #   MINILLM_DIR=~/MiniLLM         where to clone
 #   MINILLM_DATA=~/minillm        where models/caches go (put this on the big NVMe)
-#   MINILLM_QUANT=UD-IQ2_XXS      which unsloth quant to fetch (UD-IQ2_XXS | UD-IQ2_XS)
-#   MINILLM_SKIP_DOWNLOAD=1       set up everything but do not start the 630 GB fetch
+#   MINILLM_MODEL=qwen3.5-397b    which model: qwen3.5-397b (default, ~250 GB, faster+better
+#                                 on this hardware) or qwen3.8-2.4t (~680 GB)
+#   MINILLM_QUANT=...             override the model's default quant (see catalog below)
+#   MINILLM_SKIP_DOWNLOAD=1       set up everything but do not start the model fetch
 #   MINILLM_SKIP_TUNING=1         skip the sudo sysctl / swap questions
 #   MINILLM_YES=1                 answer yes to every prompt (unattended)
 
@@ -49,7 +51,6 @@ gib()   { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
 
 MINILLM_DIR="${MINILLM_DIR:-$HOME/MiniLLM}"
 MINILLM_DATA="${MINILLM_DATA:-$HOME/minillm}"
-MINILLM_QUANT="${MINILLM_QUANT:-UD-IQ2_XXS}"
 REPO_URL="https://github.com/hardcoregamingsyle/MiniLLM.git"
 LLAMA_DIR="$HOME/llama.cpp"
 HF_HOME_DIR="$MINILLM_DATA/hf"
@@ -58,12 +59,40 @@ BASHRC="$HOME/.bashrc"
 MARK_BEGIN="# >>> MiniLLM >>>"
 MARK_END="# <<< MiniLLM <<<"
 
-MODEL_REPO="unsloth/Qwen3.8-2.4T-A95B-GGUF"
-DRAFT_REPO="a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF"
-DRAFT_FILE="Qwen3.8-2.4T-A95B-MTP-ONLY-Q4_K_M.gguf"
-# Bytes, verified against the Hub listing on 2026-08-15.
-declare -A QUANT_BYTES=( [UD-IQ2_XXS]=656500000000 [UD-IQ2_XS]=730700000000 )
-DRAFT_BYTES=19897255520
+# ------------------------------------------------------------ model catalog
+# MINILLM_MODEL selects a row. Byte counts were read from the Hub listings on
+# 2026-08-15; the installer only uses them for the free-space guard.
+#
+#   qwen3.5-397b  (DEFAULT) 397B total / 17B active. UD-Q4_K_XL keeps attention
+#                 near-Q8 and experts Q4. 245 GB + 6 GB MTP draft. On a 4-core
+#                 AVX2 laptop with a PCIe 3.0 NVMe, capacity.py puts this at
+#                 ~1.6 tok/s single / ~2.8 with MTP -- clears the 2 tok/s aim.
+#   qwen3.8-2.4t  2.4T total / 95B active. UD-IQ2_XXS. 656 GB + 20 GB draft.
+#                 Same machine: ~0.3-0.9 tok/s; MTP HURTS at PCIe 3.0 speeds
+#                 because drafting touches more experts than the disk can feed.
+#                 The bigger name, the slower and worse-quality result here.
+MINILLM_MODEL="${MINILLM_MODEL:-qwen3.5-397b}"
+case "$MINILLM_MODEL" in
+  qwen3.5-397b)
+    MODEL_REPO="unsloth/Qwen3.5-397B-A17B-GGUF"
+    MINILLM_QUANT="${MINILLM_QUANT:-UD-Q4_K_XL}"
+    declare -A QUANT_BYTES=( [UD-Q4_K_XL]=245272000000 [UD-Q4_K_M]=240000000000 [UD-IQ4_XS]=215000000000 [UD-Q6_K]=330000000000 [UD-Q8_K_XL]=430000000000 )
+    DRAFT_REPO="a4lg/Qwen3.5-397B-A17B-MTP-ONLY-GGUF"
+    DRAFT_FILE="Qwen3.5-397B-A17B-MTP-ONLY-Q4_K_M.gguf"
+    DRAFT_BYTES=6233573120
+    MODEL_PATTERN="Qwen3.5-397B-A17B-${MINILLM_QUANT}"
+    ;;
+  qwen3.8-2.4t)
+    MODEL_REPO="unsloth/Qwen3.8-2.4T-A95B-GGUF"
+    MINILLM_QUANT="${MINILLM_QUANT:-UD-IQ2_XXS}"
+    declare -A QUANT_BYTES=( [UD-IQ2_XXS]=656500000000 [UD-IQ2_XS]=730700000000 )
+    DRAFT_REPO="a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF"
+    DRAFT_FILE="Qwen3.8-2.4T-A95B-MTP-ONLY-Q4_K_M.gguf"
+    DRAFT_BYTES=19897255520
+    MODEL_PATTERN="Qwen3.8-2.4T-A95B-${MINILLM_QUANT}"
+    ;;
+  *) die "Unknown MINILLM_MODEL='$MINILLM_MODEL'. Use qwen3.5-397b (default) or qwen3.8-2.4t." ;;
+esac
 
 # ------------------------------------------------------------------ 0. preflight
 step "0/7  Preflight"
@@ -83,7 +112,7 @@ mkdir -p "$MINILLM_DATA"
 FREE_B=$(df --output=avail -B1 "$MINILLM_DATA" | tail -1)
 printf '    Disk : %s GiB free at %s\n' "$(gib "$FREE_B")" "$MINILLM_DATA"
 NEED_B=$(( ${QUANT_BYTES[$MINILLM_QUANT]:-0} + DRAFT_BYTES ))
-[[ $NEED_B -gt 0 ]] || die "Unknown MINILLM_QUANT='$MINILLM_QUANT'. Use UD-IQ2_XXS or UD-IQ2_XS."
+[[ $NEED_B -gt 0 ]] || die "Unknown MINILLM_QUANT='$MINILLM_QUANT' for $MINILLM_MODEL. Known: ${!QUANT_BYTES[*]}"
 # Credit what is already on disk, or every re-run would die here once a third
 # of the model had landed -- and "just re-run to resume" would be a lie. The
 # repo dirs do not exist on a fresh install, so guard each one.
@@ -150,9 +179,10 @@ fi
   echo "export HF_HUB_CACHE=\"$HF_CACHE_DIR\""
   echo "export MINILLM_LLAMA_BIN=\"$LLAMA_DIR/build/bin\""
   echo "export MINILLM_DATA=\"$MINILLM_DATA\""
+  echo "export MINILLM_MODEL_PATTERN=\"$MODEL_PATTERN\""
   echo "$MARK_END"
 } >> "$BASHRC"
-export HF_HOME="$HF_HOME_DIR" HF_HUB_CACHE="$HF_CACHE_DIR" MINILLM_LLAMA_BIN="$LLAMA_DIR/build/bin" MINILLM_DATA
+export HF_HOME="$HF_HOME_DIR" HF_HUB_CACHE="$HF_CACHE_DIR" MINILLM_LLAMA_BIN="$LLAMA_DIR/build/bin" MINILLM_DATA MINILLM_MODEL_PATTERN="$MODEL_PATTERN"
 ok "HF_HOME=$HF_HOME_DIR (written to ~/.bashrc)"
 
 # Token: kept OUT of the block above so re-running never overwrites it, and
@@ -163,7 +193,7 @@ EOF
 then
   ok "already authenticated as $(python -c 'from huggingface_hub import whoami; print(whoami()["name"])' 2>/dev/null || echo '(env HF_TOKEN)')"
 else
-  printf '    A Hugging Face token makes the 630 GB download much faster (higher rate limits).\n'
+  printf '    A Hugging Face token makes the model download much faster (higher rate limits).\n'
   printf '    Get one (read scope) at: https://huggingface.co/settings/tokens\n'
   if [[ "${MINILLM_YES:-0}" == 1 ]]; then
     warn "MINILLM_YES=1 and no HF_TOKEN in env: continuing unauthenticated (slow). Set HF_TOKEN=... to fix."
@@ -327,7 +357,7 @@ cat <<EOF
     Everything is set up. Open a NEW terminal (or: source ~/.bashrc) and then:
 
       cd $MINILLM_DIR
-      bash run.sh                # runs the model once the download finishes
+      bash run.sh                # runs $MINILLM_MODEL once the download finishes
       bash run.sh --draft        # same, with MTP speculative decoding
       bash run.sh --chat         # interactive chat
 

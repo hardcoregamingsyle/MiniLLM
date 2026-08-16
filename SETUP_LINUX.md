@@ -1,10 +1,27 @@
 # MiniLLM — Linux Mint setup (the target machine)
 
-Target: Linux Mint, 32 GB RAM, ~920 GB free on NVMe. Goal: run
-`Qwen/Qwen3.8-2.4T-A95B` at ≥ 1 tok/s (floor), aiming for 2.
+Target: Linux Mint (XFCE / X11), **Intel i5-10210U** (4 cores / 8 threads,
+Comet Lake-U, AVX2, 15 W), 32.6 GB DDR4, NVMe, ~920 GB free, Radeon 520/610
+Mobile (2 GB) + Intel UHD iGPU. Goal: run `Qwen/Qwen3.8-2.4T-A95B` at ≥ 1 tok/s
+(floor), aiming for 2.
 
-Everything below is a copy-paste sequence. Total download is ~630 GB, so
-Step 3 is the long pole — start it early and do Steps 4–5 while it runs.
+Three facts about this specific machine that shape everything below:
+
+- **PCIe 3.0 only.** 10th-gen U-series has no Gen4 lanes, so the NVMe tops out
+  around 3–3.5 GB/s, not the 5.5–7 a Gen4 drive is rated for. Expert
+  streaming from disk is the bottleneck for this model, so this is *the*
+  constraint. Step 5 measures the real figure.
+- **Neither GPU helps.** The Radeon 520/610 is a 2 GB GCN 1.0 part — too small
+  and too old for any useful offload; the Intel iGPU shares the same DRAM
+  bandwidth the CPU needs. Everything runs `-ngl 0` on the CPU. Do not build
+  llama.cpp with HIP or Vulkan; it only adds failure modes.
+- **15 W thermal envelope.** All-core AVX2 throttles after ~30 s. Sustained
+  tok/s will be lower than a short benchmark suggests; run 7a for at least 64
+  tokens to see the settled rate. A cooling pad or `powersave`→`performance`
+  governor is a real, measurable lever here.
+
+Everything below is a copy-paste sequence. The model download (250 GB default,
+680 GB for the 2.4T) is the long pole — start it early and do Steps 4–5 while it runs.
 
 ---
 
@@ -95,28 +112,36 @@ If that last line prints your username, downloads will run authenticated
 (higher rate limits, faster). If it errors, fix it before Step 3 — nothing
 after this works unauthenticated.
 
-**Choosing the quant.** 920 GB free forces ≤ 2-bit routed experts. Exact
-sizes of the unsloth GGUFs (measured, not estimated):
+**Choosing the model and quant.** The installer's default is
+`Qwen3.5-397B-A17B` at `UD-Q4_K_XL`; `MINILLM_MODEL=qwen3.8-2.4t` selects the
+2.4T at `UD-IQ2_XXS`. Here is why, with exact sizes read from the Hub:
 
-| Quant | Size | Verdict |
-| --- | --- | --- |
-| UD-IQ2_XXS | 611.5 GB | **recommended** — best quality that fits with room |
-| UD-IQ2_XS | 680.5 GB | fits, ~240 GB left; slightly better quality |
-| UD-IQ3_XXS | 889.9 GB | **does not fit** — see below |
+| Model / quant | Size | Fits 920 GB? | tok/s here (single / +MTP) |
+| --- | --- | --- | --- |
+| **Qwen3.5-397B UD-Q4_K_XL** | **245 GB** | **yes** | **1.6 / 2.8** |
+| Qwen3.8-2.4T UD-IQ2_XXS | 656 GB | yes | 0.72 / 0.48 |
+| Qwen3.8-2.4T UD-IQ2_XS | 731 GB | yes | ~0.7 / ~0.5 |
+| Qwen3.8-2.4T UD-IQ3_XXS ("3-bit") | 956 GB | **no** — 36 GB over, before the 20 GB draft | 0.36 |
+| Qwen3.8-2.4T UD-IQ4_XS ("4-bit") | 1,311 GB | **no** — 411 GB over | 0.13 |
 
-Plus the MTP draft model for speculative decoding (18.5 GB). Total ≈ 630 GB.
+Two facts, both physical:
 
-Why IQ3_XXS does not fit in 920 GB even though 889.9 < 920: the model is not
-the only thing on the disk. The MTP draft is 18.5 GB, `hf-xet` keeps a chunk
-cache during download, the llama.cpp build tree is ~1 GB, and a filesystem
-running above ~95% full degrades badly. 889.9 + 18.5 + cache + margin exceeds
-920. (RAM-side costs like the OS and KV cache do **not** affect this — they
-are a separate budget.)
+- **A 3-bit or 4-bit 2.4T does not fit on this disk.** IQ3_XXS alone is 956 GB
+  against 920 free; IQ4_XS is 1.3 TB. This is not a margin question.
+- **On this laptop, more bits on the 2.4T make it *slower*.** The bottleneck is
+  the PCIe 3.0 NVMe (~3 GB/s) feeding 46 B of routed-expert parameters per
+  token; every extra bit is more bytes through that pipe. IQ2_XXS is both the
+  largest 2.4T that fits and the fastest, at 0.72 tok/s — and that still misses
+  the 1 tok/s floor. The 397B at high precision clears the 2 tok/s aim.
+
+The MTP draft comes with either model (6 GB for the 397B, 20 GB for the 2.4T).
+Both fit alongside each other if you want to compare — run `install.sh` once
+per `MINILLM_MODEL`; the second run adds the model without redoing setup.
 
 Dry-run first to see exactly what will be pulled:
 
 ```bash
-python scripts/fetch_model.py --repo unsloth/Qwen3.8-2.4T-A95B-GGUF --dry-run --files "UD-IQ2_XXS/*"
+python scripts/fetch_model.py --repo unsloth/Qwen3.5-397B-A17B-GGUF --dry-run --files "UD-Q4_K_XL/*"
 ```
 
 Then start the real download in a `tmux` session so it survives you closing
@@ -127,17 +152,21 @@ sudo apt install -y tmux
 tmux new -s dl
 # inside tmux:
 source ~/MiniLLM/.venv/bin/activate && cd ~/MiniLLM
-python scripts/fetch_model.py --repo unsloth/Qwen3.8-2.4T-A95B-GGUF --files "UD-IQ2_XXS/*" --workers 8
-python scripts/fetch_model.py --repo a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF --files Qwen3.8-2.4T-A95B-MTP-ONLY-Q4_K_M.gguf
+# 397B (default):
+python scripts/fetch_model.py --repo unsloth/Qwen3.5-397B-A17B-GGUF --files "UD-Q4_K_XL/*" --workers 8
+python scripts/fetch_model.py --repo a4lg/Qwen3.5-397B-A17B-MTP-ONLY-GGUF --files Qwen3.5-397B-A17B-MTP-ONLY-Q4_K_M.gguf
+# or the 2.4T:
+# python scripts/fetch_model.py --repo unsloth/Qwen3.8-2.4T-A95B-GGUF --files "UD-IQ2_XXS/*" --workers 8
+# python scripts/fetch_model.py --repo a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF --files Qwen3.8-2.4T-A95B-MTP-ONLY-Q4_K_M.gguf
 ```
 
 Detach with `Ctrl-b d`, reattach later with `tmux attach -t dl`. The download
 resumes automatically if interrupted — just rerun the same command.
 
-At 30 MB/s that is ~6 hours; at 100 MB/s ~1.7 hours. Check progress with:
+397B: at 30 MB/s ~2.3 h, at 100 MB/s ~40 min. 2.4T: ~6 h / ~1.9 h. Check progress with:
 
 ```bash
-du -sh "$HF_HUB_CACHE"/models--unsloth--Qwen3.8-2.4T-A95B-GGUF
+du -sh "$HF_HUB_CACHE"/models--unsloth--*
 ```
 
 **Disable sleep/suspend while it runs** — Mint's power settings will otherwise
@@ -345,43 +374,67 @@ model into RAM and cannot run anything larger than RAM. Only `mmap` streams.
 
 ## 8. What to expect, honestly
 
-These are `capacity.py` outputs (75% expert-cache hit rate, MTP at k=3 with
-60% acceptance), reproducible with
-`python -m minillm.capacity report --machine server-32gb-nvme --model qwen3.8-2.4t-a95b`.
-They are **estimates until Step 5 replaces the machine constants with measured
-ones** — in particular `kernel_gbps`, which binds most rows and is currently a
-guess.
+These are `capacity.py` outputs for **this** machine — i5-10210U (4c AVX2),
+34 GB/s DRAM, **PCIe 3.0 NVMe at ~3.0 GB/s**, `kernel_gbps` 21.9 taken from a
+CI runner with the same core count and SIMD — at a 75% expert-cache hit rate,
+MTP at k=3 / 60% acceptance. Reproduce with
+`python -m minillm.capacity report --machine server-32gb-nvme --model <model>`.
+They are estimates until Step 5 replaces DRAM and disk with measured values.
+
+**Qwen3.8-2.4T-A95B on this machine:**
 
 | Attention | Experts | Cache | Single-stream | With MTP |
 | --- | --- | --- | --- | --- |
-| Q4_K_M | IQ2_XXS | 1.8 GB | 0.59 | 0.60 |
-| Q3_K_M | IQ2_XXS | 8.0 GB | 0.78 | 0.87 |
-| **Q2_K** | **IQ2_XXS** | **12.6 GB** | **0.92** | **1.30** |
-| Q2_K | IQ1_S | 12.6 GB | 1.03 | 1.68 |
+| Q4_K_M | IQ2_XXS | 1.9 GB | 0.33 | 0.33 |
+| Q3_K_M | IQ2_XXS | 8.1 GB | 0.72 | 0.48 |
+| Q2_K | IQ2_XXS | 12.7 GB | 0.84 | 0.72 |
+| Q2_K | IQ1_S | 12.7 GB | 0.94 | 1.53 |
 
-Three things this table says that are not obvious:
+**The 2.4T does not reach the 1 tok/s floor on this machine at any usable
+precision.** The one row that clears it (Q2_K attention + IQ1_S experts + MTP)
+is ~1.6-bit experts — a badly degraded model. And note the sign flip in the
+MTP column: at Q3_K_M and Q2_K attention, **speculation makes it slower**
+(0.72 → 0.48, 0.84 → 0.72). Drafting k tokens touches more distinct experts,
+and on a PCIe 3.0 disk those extra bytes cost more than the amortization saves.
+That is what the U-series PCIe 3.0 lanes do to this plan; a Gen4 slot would
+have given 1.30 on the Q2_K row.
 
-1. **The UD-IQ2_XXS file's attention precision matters more than its expert
-   precision.** Unsloth Dynamic quants keep attention higher than the routed
-   experts — good for quality — but every bit spent on the 48.7 B always-hot
-   half is a bit taken from the expert cache. At Q4_K_M attention the cache is
-   1.8 GB, MTP has nothing to amortize against, and it is disk-bound at 0.6.
-   Check what precision the downloaded file actually uses for `attn_*` tensors
-   (`llama-cli --verbose` prints per-tensor types at load); if it is Q4-ish, the
-   honest expectation is the first row.
-2. **The 1 tok/s floor is reachable; the 2 tok/s aim is not on this machine.**
-   And — correcting an earlier draft of this guide — **more RAM does not fix it.**
-   Sweeping RAM in `capacity.py`: 32 GB → 1.30, 48 GB → 1.43, 64/96/128 GB →
-   1.43. It flatlines because past ~48 GB the bottleneck is dequant *compute*,
-   not memory. Reaching 2 tok/s on the 2.4T needs a faster kernel (AVX-512
-   helps; so would a GPU for the hot half), not more DDR4.
-3. **`kernel_gbps` decides everything above 0.8 tok/s.** It is the one constant
-   in `machines.json` that has never been measured on any machine. Step 5 fixes
-   that; do not trust rows 2–4 until it has run.
+**Qwen3.5-397B-A17B on the same machine:**
 
-If IQ2 quality proves unusable in practice, the fallback is
-`Qwen3.5-397B-A17B` — a much smaller model at much better precision (Q8 attn +
-Q4 experts, 214 GB) that `capacity.py` puts at ~1.8 tok/s here.
+| Attention | Experts | Disk | Single-stream | With MTP |
+| --- | --- | --- | --- | --- |
+| **Q8_0** | **Q4_K_M** | **214 GB** | **1.64** | **2.80** |
+| Q6_K | Q4_K_M | 212 GB | 1.96 | 3.20 |
+| Q4_K_M | Q4_K_M | 209 GB | 2.44 | 3.36 |
+| Q4_K_M | Q2_K | 124 GB | 3.00 | 5.05 |
+
+**This clears both the floor and the 2 tok/s aim, with full-precision
+attention and 4-bit experts.** 397 B total, 17 B active, MTP head included,
+uses a quarter of the disk. Same family and tokenizer as the 2.4T.
+
+So the honest recommendation for *this* laptop flips from the earlier draft:
+**start with `Qwen3.5-397B-A17B` at Q8_0/Q4_K_M.** It is a much better model at
+that precision than the 2.4T at 1.6-bit, it is 3× faster, and it downloads in a
+third of the time. Set `MINILLM_MODEL=qwen3.5-397b` before running `install.sh`
+(the installer supports both). If you want the 2.4T anyway — for the name, or
+to measure it — the 656 GB fits alongside; run `install.sh` again with
+`MINILLM_MODEL=qwen3.8-2.4t` and it adds it without redoing anything else.
+
+Three things worth knowing:
+
+1. **Attention precision matters more than expert precision** for the 2.4T.
+   Every bit on the 48.7 B always-hot half is a bit taken from the expert
+   cache; at Q4_K_M attention the cache is 1.9 GB and it is disk-bound at 0.33.
+   Check what precision the downloaded UD file uses for `attn_*` tensors
+   (`llama-cli --verbose` prints per-tensor types); if Q4-ish, expect row 1.
+2. **More RAM would not fix the 2.4T here; a faster disk would.** Sweeping RAM
+   in `capacity.py` flatlines past ~48 GB. Sweeping disk: 3.0 → 5.5 GB/s moves
+   the Q2_K+MTP row from 0.72 to 1.30. The bottleneck on this machine is PCIe
+   3.0, and that is soldered.
+3. **The 15 W part will throttle.** `kernel_gbps` 21.9 came from a runner that
+   does not. Run 7a for 64+ tokens and read the settled rate, and try
+   `sudo cpupower frequency-set -g performance` — on a U-series it is worth
+   measuring.
 
 ---
 
@@ -413,6 +466,6 @@ set or not exported. `echo $MINILLM_LLAMA_BIN` should print the build dir.
 ~/MiniLLM/                    this repo (code, docs, results)
 ~/MiniLLM/.venv/              Python environment
 ~/llama.cpp/build/bin/        llama.cpp binaries built for this CPU
-~/minillm/hf/hub/             model files (on NVMe, ~630 GB)
+~/minillm/hf/hub/             model files (on NVMe, 250-680 GB)
 ~/minillm/bench_scratch/      roofline test file (deleted after run)
 ```

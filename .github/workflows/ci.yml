@@ -80,6 +80,20 @@ jobs:
             || { echo "::error::second run redid work it should have skipped"; exit 1; }
           echo "idempotent: yes"
 
+      # Both catalog rows must resolve, and re-running with the OTHER model
+      # must add its pattern without disturbing anything else.
+      - name: install.sh with MINILLM_MODEL=qwen3.8-2.4t (catalog + idempotence across models)
+        env:
+          MINILLM_MODEL: qwen3.8-2.4t
+        run: |
+          bash install.sh 2>&1 | tee /tmp/third.log
+          grep -q 'MINILLM_MODEL_PATTERN="Qwen3.8-2.4T-A95B-UD-IQ2_XXS"' ~/.bashrc || { echo "::error::2.4T pattern not written"; exit 1; }
+          ! grep -qE "compiling with|installing:|cloned to|venv created" /tmp/third.log || { echo "::error::model switch redid setup work"; exit 1; }
+          MINILLM_MODEL=nope bash install.sh 2>&1 | grep -q "Unknown MINILLM_MODEL" && echo "bad model name rejected: yes"
+          # put the default back for the steps below
+          bash install.sh >/dev/null 2>&1
+          grep -q 'MINILLM_MODEL_PATTERN="Qwen3.5-397B-A17B-UD-Q4_K_XL"' ~/.bashrc && echo "default restored: yes"
+
       - name: what install.sh left behind
         run: |
           echo "--- bashrc block ---"; sed -n '/# >>> MiniLLM >>>/,/# <<< MiniLLM <<</p' ~/.bashrc
