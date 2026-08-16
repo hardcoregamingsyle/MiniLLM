@@ -89,10 +89,20 @@ jobs:
           bash install.sh 2>&1 | tee /tmp/third.log
           grep -q 'MINILLM_MODEL_PATTERN="Qwen3.8-2.4T-A95B-UD-IQ2_XXS"' ~/.bashrc || { echo "::error::2.4T pattern not written"; exit 1; }
           ! grep -qE "compiling with|installing:|cloned to|venv created" /tmp/third.log || { echo "::error::model switch redid setup work"; exit 1; }
-          MINILLM_MODEL=nope bash install.sh 2>&1 | grep -q "Unknown MINILLM_MODEL" && echo "bad model name rejected: yes"
+          # A bad model name must be REJECTED (installer exits non-zero). Under
+          # pipefail that non-zero exit is the whole point, so capture it rather
+          # than let it kill the step.
+          set +e
+          out=$(MINILLM_MODEL=nope bash install.sh 2>&1); rc=$?
+          set -e
+          [ $rc -ne 0 ] && grep -q "Unknown MINILLM_MODEL" <<<"$out" \
+            && echo "bad model name rejected: yes (exit $rc)" \
+            || { echo "::error::MINILLM_MODEL=nope was not rejected (rc=$rc)"; exit 1; }
           # put the default back for the steps below
           bash install.sh >/dev/null 2>&1
-          grep -q 'MINILLM_MODEL_PATTERN="Qwen3.5-397B-A17B-UD-Q4_K_XL"' ~/.bashrc && echo "default restored: yes"
+          grep -q 'MINILLM_MODEL_PATTERN="Qwen3.5-397B-A17B-UD-Q4_K_XL"' ~/.bashrc \
+            && echo "default restored: yes" \
+            || { echo "::error::default model pattern not restored"; exit 1; }
 
       - name: what install.sh left behind
         run: |
