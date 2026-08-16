@@ -29,6 +29,7 @@ cd ~/MiniLLM
 bash run.sh                # generate 32 tokens, print tok/s
 bash run.sh --draft        # same, with MTP speculative decoding
 bash run.sh --chat         # talk to the model
+bash ~/minillm/download.sh qwen3.8-2.4t   # fetch the other model too (they fit side by side)
 ```
 
 Options are env vars: `MINILLM_MODEL=qwen3.8-2.4t` (the 2.4T instead of the

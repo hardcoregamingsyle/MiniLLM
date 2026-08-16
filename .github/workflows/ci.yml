@@ -106,6 +106,25 @@ jobs:
             && echo "default restored: yes" \
             || { echo "::error::default model pattern not restored"; exit 1; }
 
+      # download.sh must be a standalone, model-agnostic script: any catalog
+      # name resolves regardless of which model install.sh defaulted to.
+      - name: generated download.sh resolves any model by name
+        run: |
+          DL=/tmp/minillm/download.sh
+          [ -x "$DL" ] || { echo "::error::download.sh not generated"; exit 1; }
+          bash -n "$DL"
+          # Stub fetch_model so we exercise resolution + argument plumbing, not the network.
+          mkdir -p /tmp/stub && cat > /tmp/stub/fetch_model.py <<'PY'
+          import sys; print("STUB fetch:", " ".join(sys.argv[1:]))
+          PY
+          run_dl() { ( cd /tmp && sed "s#python scripts/fetch_model.py#python /tmp/stub/fetch_model.py#g" "$DL" > /tmp/dl_stub.sh && bash /tmp/dl_stub.sh "$@" ); }
+          run_dl                | tee /tmp/dl0.log | grep -q "unsloth/Qwen3.5-397B-A17B-GGUF" && echo "default -> 397B: yes"
+          run_dl qwen3.8-2.4t   | tee /tmp/dl1.log | grep -q "unsloth/Qwen3.8-2.4T-A95B-GGUF" && echo "arg -> 2.4T: yes"
+          run_dl qwen3.5-397b UD-Q6_K | grep -q "UD-Q6_K/\*" && echo "arg + quant: yes"
+          set +e; run_dl nope >/dev/null 2>&1; rc=$?; set -e
+          [ $rc -eq 2 ] && echo "bad name -> exit 2: yes" || { echo "::error::download.sh accepted a bad model name (rc=$rc)"; exit 1; }
+          grep -q "MTP-ONLY" /tmp/dl1.log && echo "draft fetched after main: yes"
+
       - name: what install.sh left behind
         run: |
           echo "--- bashrc block ---"; sed -n '/# >>> MiniLLM >>>/,/# <<< MiniLLM <<</p' ~/.bashrc
