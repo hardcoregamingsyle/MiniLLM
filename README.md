@@ -210,6 +210,52 @@ shipping redundant full copies of the weights:
 
 `scripts/fetch_model.py` fetches root-level files only, which handles both.
 
+## What actually moves per token — and what does not
+
+The whole point of targeting MoE is that **only the experts the router picks
+are touched**. Concretely, per generated token:
+
+| | Qwen3.5-397B (Q8 attn / Q4 exp) | Qwen3.8-2.4T (Q3 attn / IQ2 exp) |
+| --- | --- | --- |
+| Full model on disk | 213 GB | 588 GB |
+| Routed-expert pool | 204 GB (60 × 512 experts) | 569 GB (92 × 512) |
+| **Touched per token** | **13.3 GB** = 9.4 hot + 4.0 experts | **30.6 GB** = 19.5 hot + 11.1 experts |
+| Fraction of the model read | **6.3 %** | **5.2 %** |
+| Fraction of experts read | 2.0 % (10 of 512 per layer) | 2.0 % |
+
+So ~94–95 % of the weights are **never read** for any given token. That is not
+something MiniLLM has to build — it is how MoE inference already works, and
+llama.cpp already honours it: it mmaps the file and only faults in the pages
+of the experts the router selects. Nothing else is streamed.
+
+But two things are *not* selective, and this is where the design work is:
+
+1. **The "hot" half is touched on every token, by every model.** Attention,
+   the shared expert, routers, norms, `lm_head` — 9.4 GB for the 397B, 19.5 GB
+   for the 2.4T. There is no router in front of it; it *cannot* be skipped.
+   That is why it must live in RAM permanently, and why the 2.4T's 19.5 GB hot
+   set (at 3-bit!) is what starves its expert cache on a 32 GB box.
+2. **The granularity of what gets moved is the OS's, not the router's.** mmap
+   faults in 4 KB pages, and the page cache evicts 4 KB pages by LRU. When a
+   selected expert is 13 MB, that is ~3,300 individual faults per expert; on
+   the 8 GB laptop this saturated the fault handler at 300 MB/s and left three
+   cores idle (see below). The router knows "expert 217 of layer 40, all
+   13 MB, now" — the kernel only knows "page missing". A loader that reads
+   *whole selected experts* with a few large `O_DIRECT` reads, and a cache
+   that evicts *whole experts* by routing history rather than pages by
+   recency, is what `runtime/` exists to build. It moves the same 5 % of the
+   model per token — it just moves it in the right units.
+
+One clarification about a llama.cpp flag that *looks* like an expert cache but
+is not: `--n-cpu-moe N` / `--cpu-moe` decide CPU-vs-GPU **placement** of expert
+tensors. On a CPU-only machine everything is already on the CPU, so they do
+nothing — and neither pins experts in RAM against page-cache eviction. There
+is no llama.cpp flag for "keep these experts resident"; that is precisely the
+gap. And speculative decoding drafts k tokens per weight sweep, which
+amortises the *hot* half but touches the union of k tokens' experts (≈26
+distinct for 3 tokens, not 10) — which is why MTP flips negative on a slow
+disk.
+
 ## Running the baseline
 
 `bench/llama_baseline.py` drives llama.cpp (prebuilt `b10437`, AVX2 `haswell`
