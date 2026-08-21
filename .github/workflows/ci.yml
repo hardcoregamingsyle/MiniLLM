@@ -213,6 +213,17 @@ jobs:
           grep -q "NOT under pressure" /tmp/ec.log \
             && echo "correctly reports no-skew-to-learn when the model fits in RAM" \
             || { echo "::error::did not detect the saturated/no-pressure case"; exit 1; }
+          # --merge-stats must ACCUMULATE across sessions, not overwrite, so
+          # several short runs add up to one long one.
+          rm -f /tmp/ec.json
+          python tools/expert_cache.py "$M" --observe 4 --interval 2 --merge-stats /tmp/ec.json --report-only >/dev/null
+          s1=$(python -c "import json;print(json.load(open('/tmp/ec.json'))['samples'])")
+          python tools/expert_cache.py "$M" --observe 4 --interval 2 --merge-stats /tmp/ec.json --report-only >/dev/null
+          s2=$(python -c "import json;print(json.load(open('/tmp/ec.json'))['samples'])")
+          echo "merge-stats samples: $s1 -> $s2"
+          [ "$s2" -gt "$s1" ] || { echo "::error::--merge-stats did not accumulate ($s1 -> $s2)"; exit 1; }
+          python tools/expert_cache.py "$M" --load-stats /tmp/ec.json --report-only | grep -q "experts seen" \
+            && echo "saved histogram reloads: yes"
 
       - name: run.sh end-to-end on Linux
         env:
