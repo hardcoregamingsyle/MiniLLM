@@ -18,6 +18,16 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 [[ -f .venv/bin/activate ]] && source .venv/bin/activate
 
+# Everything this script prints -- banner, memory state, locker check, the
+# per-phase I/O table -- goes to results/session.log as well as the terminal.
+# Skipped for --chat: process substitution makes stdout a pipe, and llama-cli
+# changes its behaviour when stdout is not a tty.
+if [[ -z "${MINILLM_TEED:-}" && " $* " != *" --chat "* ]]; then
+  mkdir -p "$here/results"
+  export MINILLM_TEED=1
+  exec > >(tee "$here/results/session.log") 2>&1
+fi
+
 # Pull env from ~/.bashrc's MiniLLM block if this shell did not source it.
 if [[ -z "${MINILLM_LLAMA_BIN:-}" && -f "$HOME/.bashrc" ]]; then
   eval "$(sed -n '/# >>> MiniLLM >>>/,/# <<< MiniLLM <<</p' "$HOME/.bashrc" | grep '^export' || true)"
@@ -318,6 +328,17 @@ if n > 0 and d > 0:
     print(f"  per token  : {d/n:.2f} s/token   =   {n/d:.4f} tok/s")
     print("  NOTE: includes model load. The per-phase table below")
     print("        separates generation from it -- read that one.")
+    # A rate the machine cannot physically reach is not a result. Every token
+    # moves tens of GB of weights across DDR4-2666 (~20-25 GB/s realistic), so
+    # anything this fast means the forward pass did not happen: a different
+    # file got opened, no tokens were really generated, or the number being
+    # read is the batched prompt phase rather than generation.
+    if n / d > 0.5:
+        print("")
+        print("  IMPLAUSIBLE: this is faster than DRAM bandwidth allows for a")
+        print("  model this size. Check which file was opened, and whether any")
+        print("  tokens were actually produced:")
+        print("    grep -E \'loaded meta data|model params|model size\' results/run.log")
 # 4 counters before + 4 after when /proc/vmstat had all three keys.
 if len(a) >= 10:
     pin0, mf0, sw0 = (int(x) for x in a[4:7])

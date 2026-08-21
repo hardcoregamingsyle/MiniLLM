@@ -32,3 +32,4 @@ results/*.tsv
 Thumbs.db
 runtime/*.so
 runtime/shimtest
+results/session.log
