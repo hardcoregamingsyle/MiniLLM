@@ -211,6 +211,68 @@ shipping redundant full copies of the weights:
 
 `scripts/fetch_model.py` fetches root-level files only, which handles both.
 
+## Going faster on a model far larger than RAM
+
+Measured on the 32 GB / PCIe 3.0 target running Qwen3.8-2.4T UD-IQ2_XXS:
+**30 s/token**. The cause is not bandwidth, it is *thrashing*. Per token the
+model touches ~20-26 GB of always-hot weights plus ~11 GB of routed experts.
+That exceeds usable RAM, so the page cache evicts the hot half to make room
+for experts and re-reads all of it on the very next token, at 4 KB-fault speed
+(~1.1 GB/s against a ~3 GB/s device).
+
+Three tools attack this, in order of how much they buy:
+
+| Tool | What it does | Effect |
+| --- | --- | --- |
+| `tools/lock_hot.py` | `mlock` the always-hot tensors so the kernel cannot evict them | 30 s -> ~3.7-10 s/token |
+| `tools/expert_cache.py` | learn which experts routing actually picks, pin the winners in the freed RAM | 3.7 s -> ~2.0 s/token at a 46% hit rate |
+| `tools/warm_gguf.py` | parallel first-touch of the hot set | first-token latency only |
+
+```bash
+# pin the hot half (needs sudo for RLIMIT_MEMLOCK; default is 8 MB)
+sudo -E python3 tools/lock_hot.py --pattern Qwen3.8-2.4T &
+
+# learn routing skew while generating, then pin the popular experts
+sudo -E python3 tools/expert_cache.py --pattern Qwen3.8-2.4T      --observe 900 --lock-gb 7 --save-stats ~/qwen-experts.json
+```
+
+### Why locking is the lever
+
+Everything hot is touched on *every* token and has no router in front of it,
+so it can never be skipped -- only kept. `mlock` from a sidecar process works
+because the page cache is **shared** between processes mapping the same file:
+llama.cpp's own mmap finds those pages resident and never faults them again.
+CI verifies the kernel agrees, via `/proc/self/status` VmLck:
+
+```
+hot (to lock)  :     1.79 GB in 49 regions
+experts (skip) :     9.48 GB   <- router picks ~2% per token
+locked 1.79 GB in 0.9s (2.02 GB/s)
+kernel VmLck   : 1.79 GB   <- confirmed unevictable
+```
+
+### Learning the routing skew without touching llama.cpp
+
+MoE routing is not uniform, but the kernel evicts 4 KB pages by recency, blind
+to which expert they belong to. `expert_cache.py` learns the skew instead:
+`mmap` the expert tensors (address space only, no reads), then call
+**`mincore()`** every few seconds while the model runs. It reports which pages
+are resident *without touching them* -- so residency is a free sample of which
+experts the router just chose. Aggregate pages into per-expert buckets, and
+`mlock` the winners.
+
+GGUF packs every expert of a layer into one tensor, so an expert is a computed
+slice. Verified against the real 59 GB gpt-oss-120b: **4608 experts = 36 layers
+x 128, 12.61 MB each, 3 slices (gate/up/down), 56.73 of 56.88 GB covered.**
+
+**When this does nothing, it says so.** Residency only reveals preference when
+the cache is under pressure. CI runs it on a 16 GB machine with an 11 GB model
+-- everything fits, every expert reads as 100% resident, and the tool reports
+"NOT under pressure ... no skew to learn" rather than emitting a confident
+ranking built from noise. It also warns when the histogram is too flat, which
+means the sample was too short. At 30 s/token a 3-minute observation is only
+~6 tokens against 47,104 experts, so observe long and reuse `--save-stats`.
+
 ## What actually moves per token — and what does not
 
 The whole point of targeting MoE is that **only the experts the router picks
