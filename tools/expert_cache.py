@@ -39,6 +39,11 @@ llama.cpp immediately.
   # reuse a saved histogram (skip observation)
   sudo -E python3 tools/expert_cache.py --pattern Qwen3.8-2.4T --load-stats stats.json --lock-gb 7
 
+  # ACCUMULATE across sessions -- run this a few times over a few evenings.
+  # Each round pins better experts, which speeds generation, which means the
+  # next round observes more tokens in the same wall-clock time.
+  sudo -E python3 tools/expert_cache.py --pattern Qwen3.8-2.4T \n       --merge-stats ~/qwen-experts.json --observe 14400 --lock-gb 7
+
 Linux only: needs mincore + mlock and a shared page cache.
 """
 
@@ -168,9 +173,37 @@ def observe(slices, files, seconds, interval):
         print("\n(observation interrupted; using what we have)")
     finally:
         obs.close()
-    for k in counts:
-        counts[k] /= max(n, 1)
-    return counts
+    # Return RAW sums plus the sample count, not an average. Keeping them
+    # separate is what lets several sessions merge correctly: averages cannot
+    # be re-averaged without their weights.
+    return counts, n
+
+
+def load_stats(path):
+    """-> (raw counts, n_samples). Accepts the old flat {key: score} format."""
+    d = json.load(open(path))
+    if isinstance(d, dict) and "counts" in d and "samples" in d:
+        raw, n = d["counts"], int(d["samples"])
+    else:                                   # legacy: scores were pre-averaged
+        raw, n = d, 1
+    return ({(int(k.split(":")[0]), int(k.split(":")[1])): float(v)
+             for k, v in raw.items()}, n)
+
+
+def save_stats(path, counts, n):
+    json.dump({"samples": n,
+               "counts": {f"{l}:{e}": v for (l, e), v in counts.items()}},
+              open(path, "w"))
+
+
+def merge_stats(a, na, b, nb):
+    """Combine two observation sessions by weight, not by averaging averages."""
+    out = defaultdict(float)
+    for k, v in a.items():
+        out[k] += v
+    for k, v in b.items():
+        out[k] += v
+    return out, na + nb
 
 
 def report(counts, per_expert, budget_b):
@@ -221,7 +254,12 @@ def main():
     ap.add_argument("--interval", type=float, default=3.0)
     ap.add_argument("--lock-gb", type=float, default=0.0)
     ap.add_argument("--report-only", action="store_true")
-    ap.add_argument("--save-stats"); ap.add_argument("--load-stats")
+    ap.add_argument("--save-stats", help="write the histogram here")
+    ap.add_argument("--load-stats", help="use a saved histogram, skip observing")
+    ap.add_argument("--merge-stats", metavar="FILE",
+                    help="accumulate: load FILE if present, observe, add, save back. "
+                         "Run this repeatedly to build a histogram over several "
+                         "short sessions instead of one marathon.")
     ap.add_argument("--hold-seconds", type=int, default=0)
     ap.add_argument("--stop", action="store_true")
     args = ap.parse_args()
@@ -259,21 +297,35 @@ def main():
     print(f"experts  : {len(slices)} ({n_experts} per layer)")
     print(f"per expert: {per_expert / MB:.1f} MB")
 
+    prior, prior_n = {}, 0
+    stats_path = args.merge_stats or args.load_stats
+    if stats_path and os.path.exists(stats_path):
+        prior, prior_n = load_stats(stats_path)
+        print(f"loaded {len(prior)} scores ({prior_n} prior samples) from {stats_path}")
+
     if args.load_stats:
-        raw = json.load(open(args.load_stats))
-        counts = {(int(k.split(":")[0]), int(k.split(":")[1])): v
-                  for k, v in raw.items()}
-        print(f"loaded {len(counts)} scores from {args.load_stats}")
+        counts, n_samples = prior, max(prior_n, 1)
+        if not counts:
+            print(f"{args.load_stats} not found or empty", file=sys.stderr)
+            return 1
     else:
         if sys.platform != "linux":
             print("Observation needs Linux (mincore).", file=sys.stderr)
             return 1
-        counts = observe(slices, files, args.observe, args.interval)
+        fresh, fresh_n = observe(slices, files, args.observe, args.interval)
+        if prior:
+            counts, n_samples = merge_stats(prior, prior_n, fresh, fresh_n)
+            print(f"merged: {prior_n} prior + {fresh_n} new = {n_samples} samples")
+        else:
+            counts, n_samples = fresh, fresh_n
 
-    if args.save_stats:
-        json.dump({f"{l}:{e}": v for (l, e), v in counts.items()},
-                  open(args.save_stats, "w"))
-        print(f"saved scores -> {args.save_stats}")
+    out_path = args.merge_stats or args.save_stats
+    if out_path:
+        save_stats(out_path, counts, n_samples)
+        print(f"saved {len(counts)} scores ({n_samples} samples) -> {out_path}")
+
+    # Report on averages; the file keeps raw sums so sessions can accumulate.
+    counts = {k: v / max(n_samples, 1) for k, v in counts.items()}
 
     budget_b = args.lock_gb * GB
     ranked = report(counts, per_expert, budget_b)
