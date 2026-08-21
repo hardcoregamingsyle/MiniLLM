@@ -204,10 +204,15 @@ jobs:
           [ "${n:-0}" -gt 100 ] || { echo "::error::indexed only $n experts"; exit 1; }
           # 24 layers x 32 experts = 768 for gpt-oss-20b
           [ "${n}" -eq 768 ] || echo "::warning::expected 768 experts, indexed $n"
-          seen=$(awk '/experts seen at least once/{print $6}' /tmp/ec.log)
-          echo "indexed $n experts; $seen observed resident after a real generation"
+          seen=$(awk -F: '/experts seen at least once/{split($2,a," "); print a[1]}' /tmp/ec.log)
+          echo "indexed $n experts; $seen observed resident via mincore"
           [ "${seen:-0}" -gt 0 ] || { echo "::error::mincore saw zero resident experts"; exit 1; }
-          grep -q "share of observed activity" /tmp/ec.log && echo "hit-rate projection produced: yes"
+          # This runner has 16 GB and the model is 11 GB, so the whole thing fits
+          # and every expert reads as resident. That is the no-pressure case: the
+          # tool must SAY so rather than pretend it learned a useful histogram.
+          grep -q "NOT under pressure" /tmp/ec.log \
+            && echo "correctly reports no-skew-to-learn when the model fits in RAM" \
+            || { echo "::error::did not detect the saturated/no-pressure case"; exit 1; }
 
       - name: run.sh end-to-end on Linux
         env:

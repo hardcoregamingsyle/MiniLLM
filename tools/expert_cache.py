@@ -180,6 +180,24 @@ def report(counts, per_expert, budget_b):
     if not seen:
         print("No expert residency observed. Was the model running?")
         return ranked
+
+    # Residency reveals routing PREFERENCE only when the page cache is under
+    # pressure. If the whole model fits in RAM every page stays resident, every
+    # score saturates at 1.0, and there is no skew to learn -- pinning would buy
+    # nothing because nothing is being evicted in the first place.
+    saturated = sum(1 for v in seen if v > 0.98) / len(ranked)
+    if saturated > 0.9:
+        print(f"\nNOTE: {saturated:.0%} of experts are ~always resident, so the page")
+        print("cache is NOT under pressure -- the model fits in RAM here. There is")
+        print("no skew to learn and nothing to gain from pinning. This tool is for")
+        print("the case where the model is much larger than RAM.")
+        return ranked
+    spread = (max(seen) - min(seen)) if len(seen) > 1 else 0.0
+    if spread < 0.05:
+        print(f"\nNOTE: popularity is nearly flat (spread {spread:.3f}). Either the")
+        print("sample is too short or routing is close to uniform; pinning the top")
+        print("experts would be little better than pinning random ones. Observe")
+        print("across more generated tokens (--observe).")
     fits = int(budget_b // per_expert) if per_expert else 0
     top = ranked[:fits]
     covered = sum(v for _, v in top)
