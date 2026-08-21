@@ -135,12 +135,17 @@ if [[ $lock == 1 ]]; then
     # The redirect must happen INSIDE the root shell: `sudo cmd > file` would
     # open the file as the invoking user (shellcheck SC2024).
     # MINILLM_LOCK_GB caps the pin. When the hot set exceeds RAM, pinning as
-    # much as fits still removes those bytes from every future token's read.
-    # Default: leave 6 GB for the expert cache, KV cache and compute buffers.
+    # much as fits still removes those bytes from every future token's read --
+    # but only up to a point. Locked pages are unevictable, so an over-large
+    # pin starves llama.cpp's anonymous memory (KV cache, compute buffers) and
+    # leaves no page cache for the unpinned remainder to stream through. The
+    # machine then swaps, and swap reads compete with model reads on the same
+    # NVMe. Default: leave 10 GB. Sweep MINILLM_LOCK_GB to find this machine's
+    # actual optimum -- it is a real tradeoff curve, not a bigger-is-better dial.
     _lockgb="${MINILLM_LOCK_GB:-}"
     if [[ -z "$_lockgb" ]]; then
       _memgb=$(awk '/MemTotal/{printf "%.0f", $2/1048576}' /proc/meminfo)
-      _lockgb=$(( _memgb > 10 ? _memgb - 6 : 4 ))
+      _lockgb=$(( _memgb > 14 ? _memgb - 10 : 4 ))
     fi
     echo "  pin budget: ${_lockgb} GB"
     # ulimit -l unlimited inside the ROOT shell. Root may raise its own hard
@@ -186,6 +191,22 @@ if [[ -n "$_ra_dev" && -r "/sys/block/$_ra_dev/queue/read_ahead_kb" ]]; then
   [[ "$_ra" -le 256 ]] && echo "note   : readahead on $_ra_dev is ${_ra} kB -- try 'bash tools/tune_io.sh' (free, no quality cost)"
 fi
 
+# Memory state at the moment the model starts. If MemAvailable is small or
+# SwapFree has moved, the run below is measuring thrash, not the model.
+awk '
+  /^MemTotal:/     {t=$2}
+  /^MemAvailable:/ {a=$2}
+  /^Mlocked:/      {l=$2}
+  /^SwapTotal:/    {st=$2}
+  /^SwapFree:/     {sf=$2}
+  END {
+    printf "memory : %.1f GB total, %.1f GB available, %.1f GB locked\n",
+           t/1048576, a/1048576, l/1048576
+    if (st > 0) printf "swap   : %.1f GB of %.1f GB free\n", sf/1048576, st/1048576
+    else        printf "swap   : none\n"
+    if (a/1048576 < 6)
+      printf "  WARNING: only %.1f GB available. Anonymous memory will go to swap and\n         swap reads compete with model reads on the same disk.\n         Try a smaller pin:  MINILLM_LOCK_GB=16 bash run.sh --lock\n", a/1048576
+  }' /proc/meminfo
 echo "model  : $model"
 echo "binary : $exe"
 echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm   lock: $lock"
