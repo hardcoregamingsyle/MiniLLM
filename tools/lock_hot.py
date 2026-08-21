@@ -170,6 +170,18 @@ def lock_files(per_file, hot_b):
     return held
 
 
+def vmlck_bytes():
+    """This process's locked memory per the kernel, or None if unavailable."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmLck:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 def unlock_all(held):
     for addr, length in held:
         libc().munlock(ctypes.c_void_p(addr), length)
