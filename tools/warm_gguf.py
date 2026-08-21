@@ -56,6 +56,7 @@ class Gguf:
         self.path = path
         self.tensors = []      # [(name, abs_offset, size)]
         self.alignment = 32
+        self.kv = {}           # selected metadata (expert_count, block_count, ...)
         self._parse()
 
     def _parse(self):
@@ -68,12 +69,21 @@ class Gguf:
                 raise ValueError(f"GGUF v{version} not supported (v2+ only)")
             n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
 
+            # Keys worth keeping: alignment affects where tensor data starts,
+            # and expert_count lets a caller slice the per-layer expert tensors
+            # (blk.N.ffn_*_exps.weight holds ALL experts back to back) into
+            # individual experts.
+            WANT = ("general.alignment",)
+            WANT_SUFFIX = (".expert_count", ".expert_used_count", ".block_count")
             for _ in range(n_kv):
                 key = self._str(f)
                 (vtype,) = struct.unpack("<I", f.read(4))
-                val = self._value(f, vtype, want=key == "general.alignment")
-                if key == "general.alignment" and isinstance(val, int) and val > 0:
-                    self.alignment = val
+                keep = key in WANT or key.endswith(WANT_SUFFIX)
+                val = self._value(f, vtype, want=keep)
+                if keep and isinstance(val, int):
+                    self.kv[key] = val
+                    if key == "general.alignment" and val > 0:
+                        self.alignment = val
 
             infos = []
             for _ in range(n_tensors):

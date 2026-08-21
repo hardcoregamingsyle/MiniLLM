@@ -187,6 +187,28 @@ jobs:
           final=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
           echo "after release, Mlocked: ${final} kB"
 
+      # expert_cache.py: index experts, then LEARN which ones routing actually
+      # used by sampling page residency with mincore(). The generation in the
+      # next steps leaves its experts resident, so residency is real signal.
+      - name: expert_cache indexes and observes real routing
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+        run: |
+          source .venv/bin/activate
+          M=$(find -L /tmp/minillm/hf/hub -path '*/snapshots/*' -name 'gpt-oss-20b-MXFP4.gguf' | head -1)
+          # Generate first so the page cache holds the experts routing chose.
+          "$MINILLM_LLAMA_BIN"/llama-completion -m "$M" -t 2 -n 8 -c 512 -ngl 0             --no-repack -no-cnv --no-warmup -p "The capital of France is" >/dev/null 2>&1 || true
+          python tools/expert_cache.py "$M" --observe 6 --interval 2 --report-only 2>&1 | tee /tmp/ec.log
+          grep -qE "^experts  : [0-9]+" /tmp/ec.log || { echo "::error::no experts indexed"; exit 1; }
+          n=$(awk '/^experts  :/{print $3}' /tmp/ec.log)
+          [ "${n:-0}" -gt 100 ] || { echo "::error::indexed only $n experts"; exit 1; }
+          # 24 layers x 32 experts = 768 for gpt-oss-20b
+          [ "${n}" -eq 768 ] || echo "::warning::expected 768 experts, indexed $n"
+          seen=$(awk '/experts seen at least once/{print $6}' /tmp/ec.log)
+          echo "indexed $n experts; $seen observed resident after a real generation"
+          [ "${seen:-0}" -gt 0 ] || { echo "::error::mincore saw zero resident experts"; exit 1; }
+          grep -q "share of observed activity" /tmp/ec.log && echo "hit-rate projection produced: yes"
+
       - name: run.sh end-to-end on Linux
         env:
           HF_HUB_CACHE: /tmp/minillm/hf/hub
