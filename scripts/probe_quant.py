@@ -116,6 +116,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("subdir", help="quant folder, e.g. UD-Q1_0")
+    ap.add_argument("--only", help="substring filter, e.g. Q4_K_M")
     ap.add_argument("--ram", type=float, default=31.0, help="machine RAM in GB")
     ap.add_argument("--os-reserve", type=float, default=4.0)
     args = ap.parse_args()
@@ -125,9 +126,13 @@ def main():
 
     api = HfApi()
     info = api.model_info(args.repo, files_metadata=True)
+    # subdir "." (or "") means the .gguf files live at the repo root.
+    pref = "" if args.subdir in (".", "") else args.subdir + "/"
     shards = sorted((s for s in info.siblings
-                     if s.rfilename.startswith(args.subdir + "/")
-                     and s.rfilename.endswith(".gguf")),
+                     if s.rfilename.startswith(pref)
+                     and s.rfilename.endswith(".gguf")
+                     and (pref or "/" not in s.rfilename)
+                     and (not args.only or args.only in s.rfilename)),
                     key=lambda s: s.rfilename)
     if not shards:
         print(f"no .gguf under {args.subdir}/ in {args.repo}", file=sys.stderr)

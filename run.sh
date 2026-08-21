@@ -168,10 +168,36 @@ echo
 
 if [[ $mode == chat ]]; then
   exec "$exe" "${args[@]}" "${extra[@]}"
-elif [[ $draft == 1 ]]; then
-  # llama-cli path: -st = answer once then exit. It prints a rounded
-  # "[ Prompt: X t/s | Generation: Y t/s ]" (one decimal; 0.0 = under 0.05).
-  exec "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null
-else
-  exec "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null
 fi
+
+# Always time it on the wall clock. llama-cli's own meter rounds to ONE
+# decimal, so it prints "Generation: 0.0 t/s" for anything slower than
+# 20 s/token -- 45 s/token and 25 s/token look identical in it. That is
+# useless on a machine where we are trying to move exactly that number.
+t0=$(date +%s.%N)
+if [[ $draft == 1 ]]; then
+  # llama-cli path: -st = answer once then exit.
+  "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null
+else
+  "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null
+fi
+rc=$?
+t1=$(date +%s.%N)
+
+awk -v t0="$t0" -v t1="$t1" -v n="$ntok" -v rc="$rc" 'BEGIN{
+  d=t1-t0;
+  printf "
+---------------- wall clock ----------------
+";
+  printf "  total      : %.1f s for %d tokens (exit %d)
+", d, n, rc;
+  if (n>0 && d>0) {
+    printf "  per token  : %.2f s/token   =   %.4f tok/s
+", d/n, n/d;
+    printf "  NOTE: includes model load. Re-run for the warm figure, and
+";
+    printf "        compare THIS number between settings -- not the 1-decimal meter.
+";
+  }
+}'
+exit $rc
