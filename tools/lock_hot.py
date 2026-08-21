@@ -21,7 +21,8 @@ The routed-expert pool is deliberately left alone: it is 95% of the file and
 the router picks ~2% of it per token. Locking that is neither possible nor
 useful.
 
-  sudo python3 tools/lock_hot.py --pattern Qwen3.8-2.4T   # lock and hold
+  sudo -E python3 tools/lock_hot.py --pattern Qwen3.8-2.4T  # lock and hold
+     (-E preserves HF_HUB_CACHE; sudo strips it and the search fails)
   python3 tools/lock_hot.py --pattern Qwen3.8-2.4T --dry-run
   python3 tools/lock_hot.py --stop                        # release
 
@@ -129,7 +130,7 @@ def plan(files):
 def explain_limit(lim, hot_b):
     print(f"\nRLIMIT_MEMLOCK is {lim / MB:.0f} MB but {hot_b / GB:.1f} GB must be locked.")
     print("Fix with EITHER:")
-    print("  sudo python3 tools/lock_hot.py ...          (simplest)")
+    print("  sudo -E python3 tools/lock_hot.py ...        (simplest; -E keeps HF_HUB_CACHE)")
     print("  or raise it permanently, then log out and back in:")
     print('    echo "$USER hard memlock unlimited" | sudo tee -a /etc/security/limits.conf')
     print('    echo "$USER soft memlock unlimited" | sudo tee -a /etc/security/limits.conf')
@@ -206,6 +207,16 @@ def main():
     files = sorted(set(files))
     if not files:
         print("No GGUF matched. Pass a path or --pattern.", file=sys.stderr)
+        # sudo strips the environment by default, so HF_HUB_CACHE / HF_HOME are
+        # gone and the search ran against the wrong directory as root. This is
+        # the single most likely reason to land here.
+        if os.environ.get("SUDO_USER") and not os.environ.get("HF_HUB_CACHE"):
+            print(f"\nRunning under sudo without the cache path: searched\n"
+                  f"  {find_files.__globals__['HF_CACHE']}\n"
+                  f"Re-run preserving your environment:\n"
+                  f"  sudo -E python3 tools/lock_hot.py --pattern ...\n"
+                  f"or pass the GGUF path explicitly (no --pattern needed).",
+                  file=sys.stderr)
         return 1
 
     per_file, hot_b, exp_b = plan(files)

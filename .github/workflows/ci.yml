@@ -164,7 +164,10 @@ jobs:
           python -c "import sys; h,e=float('$hot'),float('$exp'); sys.exit(0 if e>h else 1)"             || { echo "::error::locker would lock the expert pool"; exit 1; }
           echo "hot $hot GB vs experts $exp GB -- locker pins only the hot half: correct"
           # Real mlock, under sudo so RLIMIT_MEMLOCK is not the binding factor.
-          sudo -n python tools/lock_hot.py --pattern gpt-oss-20b-MXFP4 > /tmp/lock1.log 2>&1 &
+          # sudo strips HF_HUB_CACHE, so resolve the path HERE and pass it.
+          M=$(find -L /tmp/minillm/hf/hub -path '*/snapshots/*' -name 'gpt-oss-20b-MXFP4.gguf' | head -1)
+          [ -n "$M" ] || { echo "::error::model file not found for mlock test"; exit 1; }
+          sudo -n sh -c "exec python3 tools/lock_hot.py '$M' >/tmp/lock1.log 2>&1" &
           for _ in $(seq 1 60); do grep -qE "^locked |failed" /tmp/lock1.log && break; sleep 1; done
           cat /tmp/lock1.log
           grep -qE "^locked [0-9.]+ GB" /tmp/lock1.log             || { echo "::error::mlock did not report locked bytes"; exit 1; }
@@ -172,7 +175,7 @@ jobs:
           mlocked=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
           echo "kernel reports Mlocked: ${mlocked} kB"
           [ "${mlocked:-0}" -gt 500000 ]             || { echo "::error::/proc/meminfo Mlocked is only ${mlocked} kB"; exit 1; }
-          sudo -n python tools/lock_hot.py --stop
+          sudo -n python3 tools/lock_hot.py --stop
           sleep 2
           after=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
           echo "after --stop, Mlocked: ${after} kB (released)"
