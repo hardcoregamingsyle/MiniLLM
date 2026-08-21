@@ -182,6 +182,9 @@ def main():
     ap.add_argument("--pattern")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stop", action="store_true", help="release a running locker")
+    ap.add_argument("--hold-seconds", type=int, default=0,
+                    help="hold the lock for N seconds then release (0 = forever). "
+                         "Lets a script verify the lock without backgrounding.")
     args = ap.parse_args()
 
     if args.stop:
@@ -262,9 +265,15 @@ def main():
 
     signal.signal(signal.SIGTERM, release)
     signal.signal(signal.SIGINT, release)
+    if args.hold_seconds > 0:
+        print(f"holding for {args.hold_seconds}s (pid {os.getpid()}), then releasing.")
+        sys.stdout.flush()
+        time.sleep(args.hold_seconds)
+        release()
     print(f"holding (pid {os.getpid()}). The hot set is now un-evictable.")
     print("Run the model in another terminal. Release with:")
     print("  python3 tools/lock_hot.py --stop")
+    sys.stdout.flush()
     while True:
         time.sleep(3600)
 
