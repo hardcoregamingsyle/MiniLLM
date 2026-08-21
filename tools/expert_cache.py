@@ -66,6 +66,10 @@ PIDFILE = "/tmp/minillm-expert-cache.pid"
 # Only the weight tensors are worth caching; the *_exps.bias tensors are tiny
 # and get pulled in with the hot set anyway.
 WEIGHT_SUFFIX = ".weight"
+# Pages probed per expert per sample. 16 pages = 64 KB is plenty to tell
+# "this expert was recently read" from "it was not", and keeps a full sample
+# of 47k experts at ~0.1 s instead of 3-5 s.
+PROBE_PAGES = 16
 
 
 def expert_slices(files):
@@ -130,15 +134,26 @@ class Observer:
                                    ctypes.POINTER(ctypes.c_ubyte)]
 
     def resident_fraction(self, path, off, size):
-        """What fraction of this byte range is currently in the page cache."""
+        """Is this expert currently in the page cache? Sampled, not exhaustive.
+
+        Checking every page of every expert costs 150 M Python operations per
+        sample on a 2.4T model -- 3-5 s of CPU, which on a 4-core laptop steals
+        a whole core from inference and makes the thing we are measuring
+        slower. An expert is read as a unit, so a small probe window answers
+        the same question ~200x cheaper.
+        """
         for p, addr, msize in self.maps:
             if p != path:
                 continue
-            a_off = off & ~(PAGE - 1)
-            length = size + (off - a_off)
-            npages = (length + PAGE - 1) // PAGE
+            # Probe a third of the way in: avoids readahead spill from the
+            # previous tensor at the start and truncation at the end.
+            probe_off = (off + size // 3) & ~(PAGE - 1)
+            npages = min(PROBE_PAGES, max(1, size // PAGE))
+            length = npages * PAGE
+            if probe_off + length > off + size:
+                probe_off = (off + size - length) & ~(PAGE - 1)
             vec = (ctypes.c_ubyte * npages)()
-            if libc().mincore(ctypes.c_void_p(addr + a_off), length, vec) != 0:
+            if libc().mincore(ctypes.c_void_p(addr + probe_off), length, vec) != 0:
                 return 0.0
             return sum(1 for b in vec if b & 1) / npages
         return 0.0
@@ -155,8 +170,10 @@ def observe(slices, files, seconds, interval):
     n = 0
     t_end = time.time() + seconds
     print(f"observing {len(slices)} experts for {seconds}s "
-          f"(sample every {interval}s)...")
+          f"(sample every {interval}s, {PROBE_PAGES} pages probed per expert)...")
     print("Run the model NOW in another terminal so there is routing to learn from.")
+    print("NOTE: this steals some CPU. Do not trust a tok/s measured while it runs --")
+    print("      measure clean afterwards, or run it under `nice -n 19`.")
     try:
         while time.time() < t_end:
             n += 1
