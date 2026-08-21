@@ -25,7 +25,7 @@ jobs:
       - name: shellcheck install.sh run.sh
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning -e SC1091 install.sh run.sh tools/diagnose.sh
+          shellcheck -S warning -e SC1091 install.sh run.sh tools/diagnose.sh tools/tune_io.sh
       - name: python compiles
         run: python3 -m py_compile bench/*.py scripts/*.py sim/*.py minillm/*.py
       - name: capacity planner runs (no downloads)

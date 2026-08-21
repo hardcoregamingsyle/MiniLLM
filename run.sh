@@ -113,7 +113,10 @@ if [[ $draft == 1 ]]; then
   [[ -n "$d" ]] || { echo "--draft: no *MTP-ONLY*.gguf under $CACHE" >&2; exit 1; }
   # MTP-ONLY is the model's own prediction head, not a standalone draft model:
   # llama.cpp must be told with --spec-type draft-mtp (per the a4lg README).
-  args+=(-md "$d" --spec-type draft-mtp --spec-draft-n-max 4)
+  # Each verify pass reads the always-hot weights ONCE for k+1 tokens, so a
+  # deeper draft directly divides the un-cacheable cost. Speculative decoding
+  # is mathematically lossless: output matches non-speculative decoding.
+  args+=(-md "$d" --spec-type draft-mtp --spec-draft-n-max "${MINILLM_DRAFT_N:-5}")
 fi
 
 if [[ $lock == 1 ]]; then
@@ -147,6 +150,14 @@ elif [[ $warm == 1 ]]; then
   echo "warming hot set with ${MINILLM_WARM_WORKERS:-8} parallel readers..."
   python3 "$here/tools/warm_gguf.py" "$model" --workers "${MINILLM_WARM_WORKERS:-8}" ||     echo "  (warm failed; continuing -- llama.cpp will fault pages in itself)"
   echo
+fi
+
+# A model larger than RAM streams constantly; the 128 KB default readahead
+# turns each contiguous 12 MB expert into ~96 fault cycles.
+_ra_dev=$(lsblk -no PKNAME "$(df --output=source "$CACHE" 2>/dev/null | tail -1)" 2>/dev/null | head -1)
+if [[ -n "$_ra_dev" && -r "/sys/block/$_ra_dev/queue/read_ahead_kb" ]]; then
+  _ra=$(cat "/sys/block/$_ra_dev/queue/read_ahead_kb")
+  [[ "$_ra" -le 256 ]] && echo "note   : readahead on $_ra_dev is ${_ra} kB -- try 'bash tools/tune_io.sh' (free, no quality cost)"
 fi
 
 echo "model  : $model"
