@@ -7,6 +7,7 @@
 #   bash run.sh --draft               same, with MTP speculative decoding
 #   bash run.sh --chat                interactive chat with the model
 #   bash run.sh --warm                pre-load the hot set with parallel readers first
+#   bash run.sh --lock                PIN the hot set in RAM (un-evictable; needs sudo)
 #   bash run.sh -p "your prompt" -n 64
 #
 # Env: MINILLM_LLAMA_BIN, HF_HUB_CACHE, MINILLM_MODEL_PATTERN, MINILLM_THREADS
@@ -31,12 +32,13 @@ PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 THREADS="${MINILLM_THREADS:-$PHYS}"
 THREADS_BATCH="${MINILLM_THREADS_BATCH:-$(nproc)}"
 
-mode=bench; draft=0; warm=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
+mode=bench; draft=0; warm=0; lock=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --chat)  mode=chat; shift ;;
     --draft) draft=1; shift ;;
     --warm)  warm=1; shift ;;
+    --lock)  lock=1; shift ;;
     -p|--prompt) prompt="$2"; shift 2 ;;
     -n) ntok="$2"; shift 2 ;;
     -t|--threads) THREADS="$2"; shift 2 ;;
@@ -114,10 +116,31 @@ if [[ $draft == 1 ]]; then
   args+=(-md "$d" --spec-type draft-mtp --spec-draft-n-max 4)
 fi
 
-if [[ $warm == 1 ]]; then
+if [[ $lock == 1 ]]; then
+  # Pin the always-hot tensors so the kernel CANNOT evict them. When
+  # hot + per-token experts exceeds RAM, the page cache throws the hot half
+  # out to make room for experts and re-reads all of it next token -- that is
+  # the 30 s/token failure mode. Locking makes only experts stream.
+  # Subsumes --warm: mlock faults every locked page in.
+  if [[ -f /tmp/minillm-lock-hot.pid ]] && [[ -e "/proc/$(cat /tmp/minillm-lock-hot.pid 2>/dev/null)" ]]; then
+    echo "hot set already pinned (pid $(cat /tmp/minillm-lock-hot.pid))"
+  else
+    echo "pinning hot set in RAM (needs sudo for RLIMIT_MEMLOCK)..."
+    sudo -b python3 "$here/tools/lock_hot.py" "$model" >/tmp/minillm-lock.log 2>&1 || true
+    for _ in $(seq 1 60); do
+      grep -q "^locked " /tmp/minillm-lock.log 2>/dev/null && break
+      grep -qE "RLIMIT_MEMLOCK|failed" /tmp/minillm-lock.log 2>/dev/null && break
+      sleep 1
+    done
+    sed -n '1,12p' /tmp/minillm-lock.log
+  fi
+  echo
+elif [[ $warm == 1 ]]; then
   # Read the always-hot tensors (attention/shared/router/embeddings/lm_head --
   # NOT the expert pool) with parallel readers. llama.cpp would otherwise fault
   # them in serially in 4 KB pages; measured 4.2x faster on a SATA disk.
+  # Warming only helps first-token latency: these pages can still be evicted.
+  # Use --lock instead when the model is much larger than RAM.
   echo "warming hot set with ${MINILLM_WARM_WORKERS:-8} parallel readers..."
   python3 "$here/tools/warm_gguf.py" "$model" --workers "${MINILLM_WARM_WORKERS:-8}" ||     echo "  (warm failed; continuing -- llama.cpp will fault pages in itself)"
   echo
@@ -125,7 +148,7 @@ fi
 
 echo "model  : $model"
 echo "binary : $exe"
-echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm"
+echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm   lock: $lock"
 echo "note   : first token is cold (page cache empty); the steady-state rate is what matters"
 echo
 

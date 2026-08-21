@@ -125,6 +125,32 @@ jobs:
           [ $rc -eq 2 ] && echo "bad name -> exit 2: yes" || { echo "::error::download.sh accepted a bad model name (rc=$rc)"; exit 1; }
           grep -q "MTP-ONLY" /tmp/dl1.log && echo "draft fetched after main: yes"
 
+      # lock_hot.py must (a) plan hot-vs-expert ranges on a real MoE, and
+      # (b) actually mlock them -- the mechanism the 30 s/token fix depends on.
+      - name: lock_hot.py plans and really mlocks
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+        run: |
+          source .venv/bin/activate
+          python tools/lock_hot.py --pattern gpt-oss-20b-MXFP4 --dry-run | tee /tmp/lock0.log
+          hot=$(awk '/hot \(to lock\)/{print $5}' /tmp/lock0.log)
+          exp=$(awk '/experts \(skip\)/{print $4}' /tmp/lock0.log)
+          python -c "import sys; h,e=float('$hot'),float('$exp'); sys.exit(0 if e>h else 1)"             || { echo "::error::locker would lock the expert pool"; exit 1; }
+          echo "hot $hot GB vs experts $exp GB -- locker pins only the hot half: correct"
+          # Real mlock, under sudo so RLIMIT_MEMLOCK is not the binding factor.
+          sudo -n python tools/lock_hot.py --pattern gpt-oss-20b-MXFP4 > /tmp/lock1.log 2>&1 &
+          for _ in $(seq 1 60); do grep -qE "^locked |failed" /tmp/lock1.log && break; sleep 1; done
+          cat /tmp/lock1.log
+          grep -qE "^locked [0-9.]+ GB" /tmp/lock1.log             || { echo "::error::mlock did not report locked bytes"; exit 1; }
+          # Kernel must agree the pages are unevictable.
+          mlocked=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
+          echo "kernel reports Mlocked: ${mlocked} kB"
+          [ "${mlocked:-0}" -gt 500000 ]             || { echo "::error::/proc/meminfo Mlocked is only ${mlocked} kB"; exit 1; }
+          sudo -n python tools/lock_hot.py --stop
+          sleep 2
+          after=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
+          echo "after --stop, Mlocked: ${after} kB (released)"
+
       - name: what install.sh left behind
         run: |
           echo "--- bashrc block ---"; sed -n '/# >>> MiniLLM >>>/,/# <<< MiniLLM <<</p' ~/.bashrc
