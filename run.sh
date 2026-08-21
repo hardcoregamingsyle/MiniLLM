@@ -129,8 +129,9 @@ if [[ $lock == 1 ]]; then
     echo "hot set already pinned (pid $(cat /tmp/minillm-lock-hot.pid))"
   else
     echo "pinning hot set in RAM (needs sudo for RLIMIT_MEMLOCK)..."
-    LOCKLOG=/tmp/minillm-lock.log
-    : > "$LOCKLOG"
+    mkdir -p "$here/results"
+    LOCKLOG="$here/results/lock.log"
+    : > "$LOCKLOG" 2>/dev/null || LOCKLOG=$(mktemp)
     # The redirect must happen INSIDE the root shell: `sudo cmd > file` would
     # open the file as the invoking user (shellcheck SC2024).
     # MINILLM_LOCK_GB caps the pin. When the hot set exceeds RAM, pinning as
@@ -193,20 +194,19 @@ fi
 rc=$?
 t1=$(date +%s.%N)
 
-awk -v t0="$t0" -v t1="$t1" -v n="$ntok" -v rc="$rc" 'BEGIN{
-  d=t1-t0;
-  printf "
----------------- wall clock ----------------
-";
-  printf "  total      : %.1f s for %d tokens (exit %d)
-", d, n, rc;
-  if (n>0 && d>0) {
-    printf "  per token  : %.2f s/token   =   %.4f tok/s
-", d/n, n/d;
-    printf "  NOTE: includes model load. Re-run for the warm figure, and
-";
-    printf "        compare THIS number between settings -- not the 1-decimal meter.
-";
-  }
-}'
+# Timing math in python3, not awk: the report needs literal newlines and
+# getting those through shell quoting into an awk program is a known way to
+# produce "runaway string constant". python3 is already a hard dependency.
+python3 - "$t0" "$t1" "$ntok" "$rc" <<'PYTIME'
+import sys
+t0, t1, n, rc = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+d = t1 - t0
+print("")
+print("---------------- wall clock ----------------")
+print(f"  total      : {d:.1f} s for {n} tokens (exit {rc})")
+if n > 0 and d > 0:
+    print(f"  per token  : {d/n:.2f} s/token   =   {n/d:.4f} tok/s")
+    print("  NOTE: includes model load. Re-run for the warm figure, and")
+    print("        compare THIS number between settings, not the 1-decimal meter.")
+PYTIME
 exit $rc
