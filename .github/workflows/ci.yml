@@ -178,6 +178,38 @@ jobs:
             || { echo "::error::draft run produced no GENERATION line -- llama-cli -st did not exit cleanly?"; exit 1; }
           echo "draft path exits cleanly: yes"
 
+      # The warmer parses GGUF metadata and must split hot vs expert tensors
+      # correctly, then read only the hot ranges with parallel readers.
+      - name: warm_gguf.py parses and warms (parallel readers)
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+        run: |
+          source .venv/bin/activate
+          python tools/warm_gguf.py --pattern gpt-oss-20b-MXFP4 --dry-run | tee /tmp/warm0.log
+          grep -qE "expert tensors :\s+[0-9]+\s+[0-9.]+ GB" /tmp/warm0.log || { echo "::error::warmer found no expert tensors in an MoE"; exit 1; }
+          hot=$(awk '/hot tensors/{print $5}' /tmp/warm0.log); exp=$(awk '/expert tensors/{print $5}' /tmp/warm0.log)
+          python - "$hot" "$exp" <<'PY'
+          import sys; hot, exp = float(sys.argv[1]), float(sys.argv[2])
+          assert exp > hot, f"experts ({exp} GB) should dominate hot ({hot} GB) in an MoE"
+          print(f"hot {hot} GB vs experts {exp} GB -- warmer skips the pool: correct")
+          PY
+          # real warm, and it must move roughly the hot-set size
+          python tools/warm_gguf.py --pattern gpt-oss-20b-MXFP4 --workers 8 | tee /tmp/warm1.log
+          grep -qE "warmed [0-9.]+ GB in [0-9.]+s" /tmp/warm1.log || { echo "::error::warm did not report bytes"; exit 1; }
+
+      - name: run.sh --warm end-to-end
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          set -o pipefail
+          bash run.sh --warm -n 8 -p "The capital of France is" 2>&1 | tee /tmp/warmrun.log
+          grep -q "warming hot set" /tmp/warmrun.log || { echo "::error::--warm did not run the warmer"; exit 1; }
+          grep -qE "threads: [0-9]+ gen / [0-9]+ batch" /tmp/warmrun.log || { echo "::error::gen/batch thread split not applied"; exit 1; }
+          grep -E "eval time" /tmp/warmrun.log || { echo "::error::no generation after warm"; exit 1; }
+          echo "--warm path works"
+
       - name: harness --generate on Linux
         env:
           HF_HUB_CACHE: /tmp/minillm/hf/hub

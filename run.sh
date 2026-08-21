@@ -6,6 +6,7 @@
 #   bash run.sh                       benchmark: 32 tokens, prints tok/s
 #   bash run.sh --draft               same, with MTP speculative decoding
 #   bash run.sh --chat                interactive chat with the model
+#   bash run.sh --warm                pre-load the hot set with parallel readers first
 #   bash run.sh -p "your prompt" -n 64
 #
 # Env: MINILLM_LLAMA_BIN, HF_HUB_CACHE, MINILLM_MODEL_PATTERN, MINILLM_THREADS
@@ -22,13 +23,20 @@ fi
 BIN="${MINILLM_LLAMA_BIN:-$HOME/llama.cpp/build/bin}"
 CACHE="${HF_HUB_CACHE:-${HF_HOME:-$HOME/minillm/hf}/hub}"
 PATTERN="${MINILLM_MODEL_PATTERN:-Qwen3.5-397B-A17B-UD-Q4_K_XL}"
-THREADS="${MINILLM_THREADS:-$(nproc)}"
+# Generation is memory-bandwidth-bound: extra hyperthreads contend for the same
+# DRAM and usually do not help, so default to PHYSICAL cores. Prompt processing
+# is compute-bound and does benefit from SMT, so it gets nproc.
+PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
+[[ "${PHYS:-0}" -gt 0 ]] 2>/dev/null || PHYS=$(nproc)
+THREADS="${MINILLM_THREADS:-$PHYS}"
+THREADS_BATCH="${MINILLM_THREADS_BATCH:-$(nproc)}"
 
-mode=bench; draft=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
+mode=bench; draft=0; warm=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --chat)  mode=chat; shift ;;
     --draft) draft=1; shift ;;
+    --warm)  warm=1; shift ;;
     -p|--prompt) prompt="$2"; shift 2 ;;
     -n) ntok="$2"; shift 2 ;;
     -t|--threads) THREADS="$2"; shift 2 ;;
@@ -97,7 +105,7 @@ fi
 
 # --no-repack is mandatory above RAM and is not the default. -c 4096 keeps the
 # KV cache small; raise it for long prompts once you know the RAM headroom.
-args=(-m "$model" -t "$THREADS" -ngl 0 --no-repack --load-mode mmap -c 4096)
+args=(-m "$model" -t "$THREADS" -tb "$THREADS_BATCH" -ngl 0 --no-repack --load-mode mmap -c 4096)
 if [[ $draft == 1 ]]; then
   d=$(findgguf "*MTP-ONLY*.gguf")
   [[ -n "$d" ]] || { echo "--draft: no *MTP-ONLY*.gguf under $CACHE" >&2; exit 1; }
@@ -106,9 +114,18 @@ if [[ $draft == 1 ]]; then
   args+=(-md "$d" --spec-type draft-mtp --spec-draft-n-max 4)
 fi
 
+if [[ $warm == 1 ]]; then
+  # Read the always-hot tensors (attention/shared/router/embeddings/lm_head --
+  # NOT the expert pool) with parallel readers. llama.cpp would otherwise fault
+  # them in serially in 4 KB pages; measured 4.2x faster on a SATA disk.
+  echo "warming hot set with ${MINILLM_WARM_WORKERS:-8} parallel readers..."
+  python3 "$here/tools/warm_gguf.py" "$model" --workers "${MINILLM_WARM_WORKERS:-8}" ||     echo "  (warm failed; continuing -- llama.cpp will fault pages in itself)"
+  echo
+fi
+
 echo "model  : $model"
 echo "binary : $exe"
-echo "threads: $THREADS   draft: $draft   mode: $mode"
+echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm"
 echo "note   : first token is cold (page cache empty); the steady-state rate is what matters"
 echo
 
