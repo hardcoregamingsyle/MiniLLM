@@ -167,6 +167,19 @@ def lock_files(per_file, hot_b):
     dt = time.perf_counter() - t0
     print(f"\nlocked {locked_b / GB:.2f} GB in {dt:.1f}s "
           f"({locked_b / GB / max(dt, 0.001):.2f} GB/s)")
+    # Self-verify against the kernel. VmLck in /proc/self/status is THIS
+    # process's locked bytes -- unambiguous, unlike system-wide Mlocked, whose
+    # accounting for file-backed shared pages varies (a GitHub runner reported
+    # 44 MB while 1.79 GB was genuinely locked).
+    vmlck = vmlck_bytes()
+    if vmlck is not None:
+        print(f"kernel VmLck   : {vmlck / GB:.2f} GB   <- confirmed unevictable")
+        if vmlck < locked_b * 0.9:
+            print(f"WARNING: kernel reports less locked than requested "
+                  f"({vmlck / GB:.2f} vs {locked_b / GB:.2f} GB)", file=sys.stderr)
+    else:
+        print("kernel VmLck   : unavailable (no /proc/self/status)")
+    sys.stdout.flush()
     return held
 
 
