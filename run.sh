@@ -126,13 +126,16 @@ if [[ $lock == 1 ]]; then
     echo "hot set already pinned (pid $(cat /tmp/minillm-lock-hot.pid))"
   else
     echo "pinning hot set in RAM (needs sudo for RLIMIT_MEMLOCK)..."
-    sudo -b python3 "$here/tools/lock_hot.py" "$model" >/tmp/minillm-lock.log 2>&1 || true
+    LOCKLOG=/tmp/minillm-lock.log
+    : > "$LOCKLOG"
+    # The redirect must happen INSIDE the root shell: `sudo cmd > file` would
+    # open the file as the invoking user (shellcheck SC2024).
+    sudo -b sh -c "exec python3 '$here/tools/lock_hot.py' '$model' >>'$LOCKLOG' 2>&1" || true
     for _ in $(seq 1 60); do
-      grep -q "^locked " /tmp/minillm-lock.log 2>/dev/null && break
-      grep -qE "RLIMIT_MEMLOCK|failed" /tmp/minillm-lock.log 2>/dev/null && break
+      grep -qE "^locked |RLIMIT_MEMLOCK|failed" "$LOCKLOG" 2>/dev/null && break
       sleep 1
     done
-    sed -n '1,12p' /tmp/minillm-lock.log
+    sed -n '1,12p' "$LOCKLOG"
   fi
   echo
 elif [[ $warm == 1 ]]; then
