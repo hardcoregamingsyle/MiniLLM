@@ -143,12 +143,28 @@ if [[ $lock == 1 ]]; then
       _lockgb=$(( _memgb > 10 ? _memgb - 6 : 4 ))
     fi
     echo "  pin budget: ${_lockgb} GB"
-    sudo -b sh -c "exec python3 '$here/tools/lock_hot.py' '$model' --max-gb '$_lockgb' >>'$LOCKLOG' 2>&1" || true
-    for _ in $(seq 1 60); do
-      grep -qE "^locked |RLIMIT_MEMLOCK|failed" "$LOCKLOG" 2>/dev/null && break
+    # ulimit -l unlimited inside the ROOT shell. Root may raise its own hard
+    # limit (CAP_SYS_RESOURCE), and mlock ignores the limit anyway once the
+    # process has CAP_IPC_LOCK -- but setting it removes the last excuse and
+    # makes the intent obvious in ps/strace.
+    sudo -b sh -c "ulimit -l unlimited 2>/dev/null; exec python3 '$here/tools/lock_hot.py' '$model' --max-gb '$_lockgb' >>'$LOCKLOG' 2>&1" || true
+    # Pinning N GB means faulting N GB in from the NVMe: minutes, not seconds.
+    # Starting llama.cpp before that finishes just makes the two fight over the
+    # same disk. Wait for the locker's summary line, streaming its progress.
+    _printed=0
+    for _ in $(seq 1 "${MINILLM_LOCK_WAIT:-1800}"); do
+      _n=$(wc -l < "$LOCKLOG" 2>/dev/null || echo 0)
+      if [[ "${_n:-0}" -gt "$_printed" ]]; then
+        sed -n "$((_printed + 1)),${_n}p" "$LOCKLOG"
+        _printed=$_n
+      fi
+      grep -qE "^locked |^Traceback|^No GGUF" "$LOCKLOG" 2>/dev/null && break
       sleep 1
     done
-    sed -n '1,12p' "$LOCKLOG"
+    if ! grep -q "^locked " "$LOCKLOG" 2>/dev/null; then
+      echo "  WARNING: no lock confirmed after ${MINILLM_LOCK_WAIT:-1800}s."
+      echo "  Continuing unpinned -- the numbers below are NOT a --lock result."
+    fi
   fi
   echo
 elif [[ $warm == 1 ]]; then

@@ -58,7 +58,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from warm_gguf import Gguf, EXPERT_RE, find_files, sibling_shards  # noqa: E402
-from lock_hot import (libc, coalesce, memlock_limit, explain_limit,  # noqa: E402
+from lock_hot import (libc, coalesce, raise_memlock, warn_limit,  # noqa: E402
                       vmlck_bytes, unlock_all, PAGE, PROT_READ,
                       MAP_SHARED, MAP_FAILED, GB, MB)
 
@@ -363,10 +363,12 @@ def main():
     per_file = {p: coalesce(v) for p, v in jobs.items()}
     want_b = sum(sz for v in per_file.values() for _, sz in v)
 
-    lim = memlock_limit()
+    # Ask the kernel, do not pre-judge: a root process has CAP_IPC_LOCK and
+    # mlock() then ignores RLIMIT_MEMLOCK entirely. Refusing here on the
+    # strength of the reported limit skipped locks that would have worked.
+    lim = raise_memlock(want_b)
     if lim is not None and lim != -1 and lim < want_b:
-        explain_limit(lim, want_b)
-        return 1
+        warn_limit(lim, want_b)
 
     from lock_hot import lock_files
     print(f"\npinning {len(chosen)} experts ({want_b / GB:.2f} GB)...")

@@ -187,6 +187,59 @@ jobs:
           final=$(awk '/^Mlocked:/{print $2}' /proc/meminfo)
           echo "after release, Mlocked: ${final} kB"
 
+      # The regression this guards: lock_hot.py used to read RLIMIT_MEMLOCK,
+      # see it was smaller than the hot set, print a "fix your limits" message
+      # and exit WITHOUT ever calling mlock. On the real 32 GB machine that
+      # silently turned every --lock run into an unpinned run -- the limit
+      # reads 3977 MB there, so a 25 GB pin never even started.
+      - name: a small RLIMIT_MEMLOCK must not stop the pin
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+        run: |
+          source .venv/bin/activate
+          M=$(find -L /tmp/minillm/hf/hub -path '*/snapshots/*' -name 'gpt-oss-20b-MXFP4.gguf' | head -1)
+          [ -n "$M" ] || { echo "::error::model file not found for the rlimit test"; exit 1; }
+
+          # ROOT with a 64 MB limit must still lock the whole hot set: either
+          # by raising the limit (CAP_SYS_RESOURCE) or because mlock ignores it
+          # (CAP_IPC_LOCK). Which one does not matter -- refusing does.
+          sudo -n bash -c "ulimit -H -l 65536; ulimit -S -l 65536; echo \"rlimit now \$(ulimit -l) kB\"; exec python3 tools/lock_hot.py '$M' --hold-seconds 4" 2>&1 | tee /tmp/lock_small.log
+          if grep -q "must be locked" /tmp/lock_small.log; then
+            echo "::error::the preemptive refusal is back"; exit 1
+          fi
+          grep -qE "^locked [0-9.]+ GB" /tmp/lock_small.log || {
+            echo "::error::root failed to lock under a 64 MB RLIMIT_MEMLOCK"; exit 1; }
+          echo "root pinned the hot set despite a 64 MB RLIMIT_MEMLOCK"
+
+          # NON-root with a HARD cap it cannot raise: mlock must stop early and
+          # KEEP what it already pinned. Discarding the chunks already locked
+          # because the next one failed throws away the whole benefit.
+          # Derive the cap from the runner's ACTUAL hard limit -- a non-root
+          # process may lower it but never raise it, and runner defaults vary
+          # from 1 MB to unlimited. Then size the chunk so a few fit inside it.
+          CAPKB=$(python - <<'EOF'
+          import resource
+          soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+          cap = 196608 if hard == resource.RLIM_INFINITY else hard // 1024
+          print(max(64, min(cap, 196608)))
+          EOF
+          )
+          CHUNK_MB=$(( CAPKB / 1024 / 4 )); [ "$CHUNK_MB" -lt 1 ] && CHUNK_MB=1
+          echo "capping memlock at ${CAPKB} kB with ${CHUNK_MB} MB chunks"
+          set +e
+          MINILLM_LOCK_CHUNK_MB=$CHUNK_MB bash -c "ulimit -H -l $CAPKB; ulimit -S -l $CAPKB; exec python3 tools/lock_hot.py '$M' --hold-seconds 4" > /tmp/lock_partial.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/lock_partial.log
+          [ $rc -eq 0 ] || { echo "::error::partial pin exited $rc instead of holding"; exit 1; }
+          python - <<'EOF'
+          t = open("/tmp/lock_partial.log").read()
+          assert "locked nothing" not in t, "kept nothing -- the all-or-nothing bug is back"
+          assert "stopped early" in t, "expected the pin to hit the memlock cap"
+          assert "still streaming" in t, "did not report the unpinned remainder"
+          print("OK: stopped at the cap, kept the pinned bytes, held instead of failing")
+          EOF
+
       # expert_cache.py: index experts, then LEARN which ones routing actually
       # used by sampling page residency with mincore(). The generation in the
       # next steps leaves its experts resident, so residency is real signal.
