@@ -8,6 +8,7 @@
 #   bash run.sh --chat                interactive chat with the model
 #   bash run.sh --warm                pre-load the hot set with parallel readers first
 #   bash run.sh --lock                PIN the hot set in RAM (un-evictable; needs sudo)
+#   bash run.sh --no-shim             disable the mmap shim (to measure its effect)
 #   bash run.sh -p "your prompt" -n 64
 #
 # Env: MINILLM_LLAMA_BIN, HF_HUB_CACHE, MINILLM_MODEL_PATTERN, MINILLM_THREADS
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --draft) draft=1; shift ;;
     --warm)  warm=1; shift ;;
     --lock)  lock=1; shift ;;
+    --no-shim) MINILLM_SHIM=0; shift ;;
     -p|--prompt) prompt="$2"; shift 2 ;;
     -n) ntok="$2"; shift 2 ;;
     -t|--threads) THREADS="$2"; shift 2 ;;
@@ -184,11 +186,41 @@ elif [[ $warm == 1 ]]; then
 fi
 
 # A model larger than RAM streams constantly; the 128 KB default readahead
-# turns each contiguous 12 MB expert into ~96 fault cycles.
+# turns each contiguous 12 MB expert into ~96 fault cycles. Raising it only
+# takes effect together with the mmap shim: do_sync_mmap_readahead() stops
+# consulting ra_pages at all once its mmap_miss counter latches, and only
+# MADV_SEQUENTIAL (which the shim sets) reaches the branch that returns before
+# that gate. Set it BEFORE launching -- llama.cpp's own POSIX_FADV_SEQUENTIAL
+# captures bdi->ra_pages at call time.
 _ra_dev=$(lsblk -no PKNAME "$(df --output=source "$CACHE" 2>/dev/null | tail -1)" 2>/dev/null | head -1)
 if [[ -n "$_ra_dev" && -r "/sys/block/$_ra_dev/queue/read_ahead_kb" ]]; then
   _ra=$(cat "/sys/block/$_ra_dev/queue/read_ahead_kb")
   [[ "$_ra" -le 256 ]] && echo "note   : readahead on $_ra_dev is ${_ra} kB -- try 'bash tools/tune_io.sh' (free, no quality cost)"
+fi
+
+# --- mmap shim ---------------------------------------------------------------
+# llama.cpp maps the model with MAP_POPULATE over the whole file (prefetch is
+# hardcoded to SIZE_MAX in llama-model.cpp's init_mappings call), so every run
+# reads all 612 GB off disk before producing a token -- that is the 451 s
+# "load time", which is 612 GB at 1.36 GB/s. It also never issues any readahead
+# advice, so the fault path's mmap_miss counter latches and every major fault
+# then reads exactly one 4 KB page. The shim strips MAP_POPULATE and sets
+# MADV_SEQUENTIAL. Neither changes a byte of the model or of the output.
+SHIM=""
+if [[ "${MINILLM_SHIM:-1}" == "1" && "$(uname -s)" == "Linux" ]]; then
+  _shim_c="$here/runtime/mmap_shim.c"
+  _shim_so="$here/runtime/mmap_shim.so"
+  mkdir -p "$here/results"
+  if [[ -f "$_shim_c" ]] && [[ ! -f "$_shim_so" || "$_shim_c" -nt "$_shim_so" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+      gcc -shared -fPIC -O2 -o "$_shim_so" "$_shim_c" -ldl \
+        >"$here/results/shim_build.log" 2>&1 \
+        || echo "note   : shim build failed -- see results/shim_build.log"
+    else
+      echo "note   : gcc not found; running without the mmap shim"
+    fi
+  fi
+  [[ -f "$_shim_so" ]] && SHIM="$_shim_so"
 fi
 
 # Memory state at the moment the model starts. If MemAvailable is small or
@@ -210,10 +242,18 @@ awk '
 echo "model  : $model"
 echo "binary : $exe"
 echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm   lock: $lock"
+if [[ -n "$SHIM" ]]; then
+  echo "shim   : on  (MAP_POPULATE stripped, MADV_SEQUENTIAL set)"
+else
+  echo "shim   : OFF -- expect ~450 s of load and 4 kB per major fault"
+fi
 echo "note   : first token is cold (page cache empty); the steady-state rate is what matters"
 echo
 
 if [[ $mode == chat ]]; then
+  if [[ -n "$SHIM" ]]; then
+    exec env "LD_PRELOAD=$SHIM" "$exe" "${args[@]}" "${extra[@]}"
+  fi
   exec "$exe" "${args[@]}" "${extra[@]}"
 fi
 
@@ -244,12 +284,16 @@ io0=$(_iosnap)
 t0=$(date +%s.%N)
 # pipefail + set -e would abort on a non-zero exit before rc is read, and a
 # trailing "|| true" resets PIPESTATUS. Turn -e off for exactly this pipeline.
+# Never an empty array here: bash 4.3 errors on "${a[@]}" when a is empty
+# and set -u is on, which every Mint release still ships.
+pre=(env)
+[[ -n "$SHIM" ]] && pre+=("LD_PRELOAD=$SHIM")
 set +e
 if [[ $draft == 1 ]]; then
   # llama-cli path: -st = answer once then exit.
-  "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
+  "${pre[@]}" "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
 else
-  "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
+  "${pre[@]}" "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
 fi
 rc=${PIPESTATUS[0]}
 set -e
@@ -296,6 +340,24 @@ if len(a) >= 10:
         print(f"  SWAPPED IN     : {swapped / GB:8.2f} GB  <- anonymous memory is")
         print("                   thrashing; that is wasted bandwidth, not model reads")
 PYTIME
+
+# Did the pin survive? The locker holds tens of GB of pinned page cache, and
+# oom_badness() counts every one of those pages as its RSS with no discount for
+# being unevictable -- so it is the fattest target on the machine. If the kernel
+# killed it mid-run the pin vanished with no error and no log line, and the
+# numbers below are an unpinned run wearing a --lock label.
+if [[ $lock == 1 ]]; then
+  _lpid=$(cat /tmp/minillm-lock-hot.pid 2>/dev/null || true)
+  if [[ -n "$_lpid" && -e "/proc/$_lpid" ]]; then
+    echo "locker : alive (pid $_lpid) -- the pin held for the whole run"
+  else
+    echo "locker : GONE. The pin did not survive the run, so the figures below"
+    echo "         are not a pinned result. Most likely the OOM killer took it:"
+    echo "           dmesg | tail -30 | grep -i -A2 'out of memory'"
+    echo "         Retry with a smaller pin: MINILLM_LOCK_GB=16 bash run.sh --lock"
+  fi
+  awk '/^Unevictable:/{printf "         Unevictable now: %.2f GB\n", $2/1048576}' /proc/meminfo
+fi
 
 # Per-phase attribution. This is the number to move.
 if [[ -s "$TRACE" ]]; then

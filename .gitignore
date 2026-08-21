@@ -30,3 +30,5 @@ results/*.tsv
 .idea/
 .DS_Store
 Thumbs.db
+runtime/*.so
+runtime/shimtest

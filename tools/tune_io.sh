@@ -6,6 +6,16 @@
 # that is ~96 separate readahead cycles per expert; at 4 MB it is 3. Fewer,
 # larger reads is exactly what an NVMe wants, and it costs nothing in quality.
 #
+# BUT this does nothing on its own, and measuring it alone will show nothing.
+# do_sync_mmap_readahead() counts misses per file in mmap_miss and, once that
+# passes 100, returns before it ever consults ra_pages -- so on a model far
+# larger than RAM the latch closes almost immediately and readahead is over.
+# Only the VM_SEQ_READ branch returns before that gate, and only MADV_SEQUENTIAL
+# sets VM_SEQ_READ. That is what runtime/mmap_shim.c does, and run.sh loads it
+# by default. Raise readahead BEFORE launching the model: llama.cpp's own
+# posix_fadvise(POSIX_FADV_SEQUENTIAL) reads bdi->ra_pages at call time and
+# doubles it, so a later change does not reach the mapping already in use.
+#
 #   bash tools/tune_io.sh            # show current, set 4 MB (asks for sudo)
 #   bash tools/tune_io.sh 8192       # set 8 MB instead
 #   bash tools/tune_io.sh --revert   # back to 128 KB

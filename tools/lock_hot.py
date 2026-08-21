@@ -38,6 +38,7 @@ import argparse
 import ctypes
 import ctypes.util
 import os
+import re
 import signal
 import sys
 import time
@@ -63,6 +64,33 @@ PIDFILE = "/tmp/minillm-lock-hot.pid"
 CHUNK = int(os.environ.get("MINILLM_LOCK_CHUNK_MB", "64")) * MB
 LOOKAHEAD = 4 * CHUNK
 PROGRESS_EVERY = 2 * GB
+
+# Which hot tensors are worth a locked page when they cannot all have one.
+# Every one of these is read on every token, but not in the same amount:
+#   routers + norms   tiny, one per layer, and the router result gates
+#                     everything downstream -- highest value per byte by far
+#   attention         read in full every token
+#   shared expert     read in full every token (it has no router in front)
+#   output.weight     full sweep every token to produce logits over the vocab
+#   token_embd        a ggml_get_rows GATHER. At -c 4096 it touches a few
+#                     thousand rows of a ~150k-row table -- under 3%. Pinning
+#                     it spends gigabytes to save megabytes, so it goes last.
+PRIORITY = [
+    (re.compile(r"ffn_gate_inp|_norm|norm\."), 0),
+    (re.compile(r"attn_"), 1),
+    (re.compile(r"shexp|ffn_.*_shexp"), 2),
+    (re.compile(r"(^|\.)output\.weight$|lm_head"), 3),
+    (re.compile(r"token_embd"), 5),
+]
+DEFAULT_PRIORITY = 4
+
+
+def priority(name):
+    for rx, p in PRIORITY:
+        if rx.search(name):
+            return p
+    return DEFAULT_PRIORITY
+
 
 _LIBC = None
 
@@ -178,7 +206,12 @@ def warn_limit(lim, want_b):
 
 
 def plan(files):
-    """-> (per_file {path: [(off,size)]}, hot_bytes, expert_bytes)"""
+    """-> (per_file {path: [(name, off, size)]}, hot_bytes, expert_bytes)
+
+    Tensor names are carried through rather than coalesced away immediately,
+    because when the hot set does not fit the budget has to be spent by
+    priority, and priority is a property of the name.
+    """
     per_file, hot_b, exp_b = {}, 0, 0
     for path in files:
         try:
@@ -191,11 +224,44 @@ def plan(files):
             if EXPERT_RE.search(name):
                 exp_b += size
             else:
-                hot.append((off, size))
+                hot.append((name, off, size))
                 hot_b += size
         if hot:
-            per_file[path] = coalesce(hot)
+            per_file[path] = hot
     return per_file, hot_b, exp_b
+
+
+def select(per_file, budget_b=0):
+    """-> ({path: [(off,size)]}, bytes_selected), highest value per byte first.
+
+    With no budget every hot tensor is taken. With one, tensors are ranked by
+    priority() and taken until the budget runs out, so the bytes that get a
+    locked page are the ones read most per byte -- not whichever tensors
+    happened to land in the first shards.
+    """
+    ranked = []
+    for path, tensors in per_file.items():
+        for name, off, size in tensors:
+            ranked.append((priority(name), path, off, size, name))
+    ranked.sort(key=lambda r: (r[0], r[1], r[2]))
+
+    chosen, kept, by_prio = {}, 0, {}
+    for prio, path, off, size, name in ranked:
+        take = size if budget_b <= 0 else min(size, int(budget_b - kept))
+        if budget_b > 0 and take < PAGE:
+            continue          # budget exhausted; keep scanning costs nothing
+        chosen.setdefault(path, []).append((off, take))
+        kept += take
+        by_prio[prio] = by_prio.get(prio, 0) + take
+        if budget_b > 0 and kept >= budget_b:
+            break
+
+    if budget_b > 0:
+        labels = {0: "routers+norms", 1: "attention", 2: "shared expert",
+                  3: "output/lm_head", 4: "other", 5: "token_embd"}
+        for p in sorted(by_prio):
+            print(f"    {labels.get(p, p):<16} {by_prio[p] / GB:7.2f} GB pinned")
+    return {p: coalesce(v) for p, v in chosen.items()}, kept
 
 
 def lock_files(per_file, want_b):
@@ -209,6 +275,7 @@ def lock_files(per_file, want_b):
     """
     held, locked_b = [], 0
     next_note = PROGRESS_EVERY
+    unevict0 = meminfo_kb("Unevictable")
     t0 = time.perf_counter()
     stopped = None
     for path, ranges in per_file.items():
@@ -266,20 +333,64 @@ def lock_files(per_file, want_b):
         print("whole point; it does not need to be all-or-nothing.")
     if locked_b < want_b:
         print(f"still streaming: {(want_b - locked_b) / GB:.2f} GB per token")
-    # Self-verify against the kernel. VmLck in /proc/self/status is THIS
-    # process's locked bytes -- unambiguous, unlike system-wide Mlocked, whose
-    # accounting for file-backed shared pages varies (a GitHub runner reported
-    # 44 MB while 1.79 GB was genuinely locked).
+    # Two different numbers, and only one of them is evidence.
+    #
+    # VmLck is mm->locked_vm: the summed LENGTH of this process's VM_LOCKED
+    # VMAs. It is charged in mlock_fixup() BEFORE __mm_populate() runs and is
+    # not rolled back if populate fails, so it says what was REQUESTED. This
+    # used to be printed as "confirmed unevictable", which claimed a proof it
+    # cannot give.
+    #
+    # /proc/meminfo Unevictable is the kernel's count of pages actually on the
+    # unevictable LRU. Its delta across the lock is the real measurement.
     vmlck = vmlck_bytes()
     if vmlck is not None:
-        print(f"kernel VmLck   : {vmlck / GB:.2f} GB   <- confirmed unevictable")
-        if vmlck < locked_b * 0.9:
-            print(f"WARNING: kernel reports less locked than requested "
-                  f"({vmlck / GB:.2f} vs {locked_b / GB:.2f} GB)", file=sys.stderr)
-    else:
-        print("kernel VmLck   : unavailable (no /proc/self/status)")
+        print(f"VmLck (asked)  : {vmlck / GB:.2f} GB")
+    if unevict0 is not None:
+        unevict1 = meminfo_kb("Unevictable")
+        if unevict1 is not None:
+            delta = (unevict1 - unevict0) * 1024
+            print(f"Unevictable +  : {delta / GB:.2f} GB   <- pages the kernel "
+                  f"moved to the unevictable LRU")
+            if delta < locked_b * 0.8:
+                print(f"WARNING: kernel only moved {delta / GB:.2f} GB of the "
+                      f"{locked_b / GB:.2f} GB requested.", file=sys.stderr)
+    if protect_from_oom():
+        print("oom_score_adj  : -1000  <- the kernel will not kill this locker")
     sys.stdout.flush()
     return held
+
+
+def meminfo_kb(key):
+    """One /proc/meminfo field in kB, or None."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+def protect_from_oom():
+    """Make this process ineligible for the OOM killer.
+
+    oom_badness() scores a process by get_mm_rss_sum(), which counts
+    MM_FILEPAGES with no discount for mlocked, unevictable or shared pages.
+    A sidecar holding 24 GB of pinned page cache therefore has a 24 GB RSS and
+    outscores llama.cpp itself. If the kernel picks it, the pin disappears
+    with no error and no log line, and the model keeps running at full cost --
+    which looks exactly like the pin never helping.
+    """
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("-1000")
+        return True
+    except OSError as e:
+        print(f"WARNING: could not set oom_score_adj ({e}). The kernel may kill "
+              f"this process and silently undo the pin.", file=sys.stderr)
+        return False
 
 
 def vmlck_bytes():
@@ -368,26 +479,14 @@ def main():
 
     per_file, hot_b, exp_b = plan(files)
     if args.max_gb > 0 and hot_b > args.max_gb * GB:
-        # Trim to the budget. Any subset works: every hot tensor is touched
-        # exactly once per token, so they are equally valuable to pin -- what
-        # matters is only how many bytes stop being re-read.
-        budget, trimmed, kept = args.max_gb * GB, {}, 0
-        for path, ranges in per_file.items():
-            keep = []
-            for off, size in ranges:
-                if kept >= budget:
-                    break
-                take = min(size, int(budget - kept))
-                if take < PAGE:
-                    break
-                keep.append((off, take))
-                kept += take
-            if keep:
-                trimmed[path] = keep
-        print(f"budget {args.max_gb:.1f} GB: pinning {kept / GB:.2f} of "
-              f"{hot_b / GB:.2f} GB hot; the remaining "
+        print(f"budget {args.max_gb:.1f} GB of {hot_b / GB:.2f} GB hot -- "
+              f"spending it by value per byte:")
+        per_file, kept = select(per_file, args.max_gb * GB)
+        print(f"  pinning {kept / GB:.2f} GB; the remaining "
               f"{(hot_b - kept) / GB:.2f} GB still streams each token.")
-        per_file, hot_b = trimmed, kept
+        hot_b = kept
+    else:
+        per_file, hot_b = select(per_file)
     print(f"files          : {len(per_file)}")
     print(f"hot (to lock)  : {hot_b / GB:8.2f} GB in "
           f"{sum(len(v) for v in per_file.values())} regions")

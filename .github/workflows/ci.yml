@@ -50,6 +50,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The shim is the difference between "reads 612 GB before the first token
+      # and then 4 KB per fault" and "reads what it needs, with readahead".
+      # Assert both halves from the kernel's own records (smaps), not from the
+      # shim's log line: Rss shows whether MAP_POPULATE ran, VmFlags "sr" shows
+      # whether VM_SEQ_READ is set.
+      - name: mmap shim strips MAP_POPULATE and sets MADV_SEQUENTIAL
+        run: |
+          gcc -shared -fPIC -O2 -Wall -Wextra -o runtime/mmap_shim.so runtime/mmap_shim.c -ldl
+          gcc -O2 -Wall -Wextra -o runtime/shimtest runtime/shimtest.c
+          runtime/shimtest /tmp/probe.bin 512 > /tmp/noshim.txt
+          MINILLM_SHIM_MIN_GB=0.25 MINILLM_SHIM_VERBOSE=1 \
+            LD_PRELOAD=$PWD/runtime/mmap_shim.so \
+            runtime/shimtest /tmp/probe.bin 512 > /tmp/shim.txt 2>/tmp/shim.err
+          echo "--- unshimmed ---"; cat /tmp/noshim.txt
+          echo "--- shimmed ---";   cat /tmp/shim.txt; cat /tmp/shim.err
+          python - <<'EOF'
+          import re, sys
+
+          def parse(p):
+              t = open(p).read()
+              rss = re.search(r"^Rss:\s+(\d+) kB", t, re.M)
+              fl = re.search(r"^VmFlags:(.*)$", t, re.M)
+              assert rss and fl, f"{p}: smaps did not report Rss/VmFlags"
+              return int(rss.group(1)), fl.group(1).split()
+
+          rss0, fl0 = parse("/tmp/noshim.txt")
+          rss1, fl1 = parse("/tmp/shim.txt")
+          print(f"unshimmed: Rss {rss0/1024:.0f} MB  VmFlags {' '.join(fl0)}")
+          print(f"shimmed  : Rss {rss1/1024:.0f} MB  VmFlags {' '.join(fl1)}")
+
+          assert rss0 > 300 * 1024, (
+              f"MAP_POPULATE should have faulted in ~512 MB, saw {rss0/1024:.0f} MB "
+              "-- the test is not measuring what it thinks")
+          assert rss1 < rss0 / 4, (
+              f"shim did not strip MAP_POPULATE: {rss1/1024:.0f} MB still resident")
+          assert "sr" not in fl0, "unshimmed mapping already carried sequential advice"
+          assert "sr" in fl1, "shim did not set MADV_SEQUENTIAL (no 'sr' in VmFlags)"
+          print("OK: populate stripped, VM_SEQ_READ set")
+          EOF
+
+          # The escape hatches have to work too, or there is no way to measure
+          # what the shim is worth.
+          MINILLM_SHIM_MIN_GB=0.25 MINILLM_SHIM_POPULATE=1 MINILLM_SHIM_ADVICE=none \
+            LD_PRELOAD=$PWD/runtime/mmap_shim.so \
+            runtime/shimtest /tmp/probe.bin 512 > /tmp/shim_off.txt
+          python - <<'EOF'
+          import re
+          t = open("/tmp/shim_off.txt").read()
+          rss = int(re.search(r"^Rss:\s+(\d+) kB", t, re.M).group(1))
+          fl = re.search(r"^VmFlags:(.*)$", t, re.M).group(1).split()
+          assert rss > 300 * 1024, f"MINILLM_SHIM_POPULATE=1 did not keep it: {rss} kB"
+          assert "sr" not in fl, "MINILLM_SHIM_ADVICE=none still set advice"
+          print("OK: MINILLM_SHIM_POPULATE=1 and ADVICE=none both honoured")
+          EOF
+
+          # And it must leave small / anonymous / writable mappings alone, or it
+          # would be perturbing allocator arenas and compute buffers too.
+          MINILLM_SHIM_VERBOSE=1 LD_PRELOAD=$PWD/runtime/mmap_shim.so \
+            runtime/shimtest /tmp/probe.bin 128 2>&1 >/dev/null | tee /tmp/shim_small.err
+          grep -q "MB mapping" /tmp/shim_small.err && {
+            echo "::error::shim touched a 128 MB mapping despite a 256 MB floor"; exit 1; }
+          echo "OK: default 256 MB floor leaves smaller mappings untouched"
+
       - name: runner facts
         run: |
           nproc; free -h; df -h /tmp | tail -1
