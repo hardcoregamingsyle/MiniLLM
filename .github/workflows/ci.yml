@@ -341,6 +341,73 @@ jobs:
           python tools/expert_cache.py "$M" --load-stats /tmp/ec.json --report-only | grep -q "experts seen" \
             && echo "saved histogram reloads: yes"
 
+      # The two models want OPPOSITE flags, and getting it backwards is silent:
+      # --no-repack on a model that fits just runs slower, and repack on a model
+      # that does not fit tries to allocate the whole file. Assert run.sh picks
+      # from the measurement rather than from a hardcoded default. The headroom
+      # knob forces both branches on whatever RAM the runner happens to have.
+      - name: run.sh picks flags from whether the model fits in RAM
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_MODEL_PATTERN: gpt-oss-20b-MXFP4
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          source .venv/bin/activate
+          MINILLM_HEADROOM_GB=0 bash run.sh --plan -n 4 | tee /tmp/plan_fits.txt
+          echo "-----"
+          MINILLM_HEADROOM_GB=100000 bash run.sh --plan -n 4 | tee /tmp/plan_streams.txt
+          python - <<'EOF'
+          import re
+
+          def read(p):
+              t = open(p).read()
+              fits = re.search(r"fits in RAM : (\d)", t)
+              cmd = re.search(r"would run:\n(.*)", t)
+              assert fits and cmd, f"{p}: --plan output not parseable\n{t}"
+              return int(fits.group(1)), cmd.group(1)
+
+          fits, cmd_fits = read("/tmp/plan_fits.txt")
+          strm, cmd_strm = read("/tmp/plan_streams.txt")
+
+          assert fits == 1, "zero headroom should have made the model fit"
+          assert strm == 0, "100 TB of headroom should have made it not fit"
+          assert "--no-repack" not in cmd_fits, (
+              "repack disabled on a model that fits -- that is free speed thrown away:\n"
+              + cmd_fits)
+          assert "--no-repack" in cmd_strm, (
+              "repack LEFT ON above RAM -- it copies tensors out of the mapping and "
+              "will try to allocate the whole model:\n" + cmd_strm)
+          print("fits    :", cmd_fits)
+          print("streams :", cmd_strm)
+          print("OK: flags follow the measurement, both directions")
+          EOF
+
+          # --plan must not have started anything: no locker, no sampler, no
+          # model load. If it did, it is not a plan.
+          [ ! -f /tmp/minillm-lock-hot.pid ] || {
+            echo "::error::--plan started the locker"; exit 1; }
+          echo "OK: --plan had no side effects"
+
+      # Switching models must not need a reinstall or an env edit.
+      - name: run.sh --model picks between downloaded models
+        env:
+          HF_HUB_CACHE: /tmp/minillm/hf/hub
+          MINILLM_LLAMA_BIN: /home/runner/llama.cpp/build/bin
+        run: |
+          source .venv/bin/activate
+          bash run.sh --model gpt-oss-20b-MXFP4 --plan | tee /tmp/plan_alias.txt
+          grep -q "gpt-oss-20b-MXFP4" /tmp/plan_alias.txt || {
+            echo "::error::--model substring did not select the model"; exit 1; }
+          # An unknown name must fail loudly, not silently fall back to whatever
+          # else happens to be on disk.
+          set +e
+          bash run.sh --model definitely-not-a-model --plan >/tmp/plan_bad.txt 2>&1
+          rc=$?
+          set -e
+          cat /tmp/plan_bad.txt
+          [ $rc -ne 0 ] || { echo "::error::unknown --model silently ran something"; exit 1; }
+          echo "OK: --model selects, and an unknown name fails loudly"
+
       - name: run.sh end-to-end on Linux
         env:
           HF_HUB_CACHE: /tmp/minillm/hf/hub

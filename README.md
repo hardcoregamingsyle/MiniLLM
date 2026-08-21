@@ -29,12 +29,28 @@ cd ~/MiniLLM
 bash run.sh                # generate 32 tokens, print tok/s
 bash run.sh --draft        # same, with MTP speculative decoding
 bash run.sh --chat         # talk to the model
-bash ~/minillm/download.sh qwen3.8-2.4t   # fetch the other model too (they fit side by side)
+bash ~/minillm/download.sh qwen3.8-27b    # fetch another model (they live side by side)
+bash run.sh --model 27b    # run it -- no reinstall, no env edit
+bash run.sh --plan         # show which model and flags it would use, then stop
 ```
 
-Options are env vars: `MINILLM_MODEL=qwen3.8-2.4t` (the 2.4T instead of the
-default 397B), `MINILLM_DATA=/mnt/big` (where the model goes), `MINILLM_QUANT=...`,
-`MINILLM_SKIP_DOWNLOAD=1`,
+Three models, downloadable side by side and switchable per run with
+`--model`:
+
+| name | size | on a 32 GB box |
+|---|---|---|
+| `qwen3.8-27b` | 17.6 GB | **fits in RAM.** Nothing streams; ~1.3–1.5 tok/s |
+| `qwen3.5-397b` | 228 GB | MoE, streams experts from disk |
+| `qwen3.8-2.4t` | 611 GB | MoE, streams; the hard case this project exists for |
+
+`run.sh` measures the model against free RAM and picks its own flags, because
+the two regimes want opposite ones — repacking tensors is free speed when the
+model fits and tries to allocate the whole file when it does not. `--plan`
+prints the decision without running anything.
+
+Options are env vars: `MINILLM_MODEL=qwen3.8-2.4t` (which model `install.sh`
+fetches; default 397B), `MINILLM_DATA=/mnt/big` (where the model goes),
+`MINILLM_QUANT=...`, `MINILLM_SKIP_DOWNLOAD=1`,
 `MINILLM_YES=1` (unattended). Prefer to see every step? The same sequence,
 explained, is in **[SETUP_LINUX.md](SETUP_LINUX.md)**.
 
@@ -155,6 +171,15 @@ The 397B at near-Q8 attention and Q4 experts is a far better model per token
 than the 2.4T at 2 bits, and it is 3–6× faster. `install.sh` defaults to it;
 `MINILLM_MODEL=qwen3.8-2.4t` gets the IQ2_XXS 2.4T for comparison. Both fit
 side by side.
+
+`qwen3.8-27b` is a different animal: 27B dense, 17.6 GB at UD-Q4_K_XL, so on a
+32 GB machine it is simply resident and the disk leaves the inner loop
+entirely. Speed becomes DRAM bandwidth divided by model size — around
+1.3–1.5 tok/s on DDR4-2666, roughly double that with the 1.4 GB MTP draft.
+The quant choice is not just about quality: Q4_K, Q4_0, IQ4_NL and MXFP4 are
+the only families with AVX2 repack kernels, so Q5_K and Q6_K cost twice over,
+more bytes per token *and* slower kernels. Hence UD-Q4_K_XL rather than
+something bigger.
 
 > **Caveat:** most rows are *kernel*-bound — the binding constant is
 > `kernel_gbps: 24`, an estimate never measured on any machine. The laptop

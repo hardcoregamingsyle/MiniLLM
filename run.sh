@@ -9,6 +9,9 @@
 #   bash run.sh --warm                pre-load the hot set with parallel readers first
 #   bash run.sh --lock                PIN the hot set in RAM (un-evictable; needs sudo)
 #   bash run.sh --no-shim             disable the mmap shim (to measure its effect)
+#   bash run.sh --model 27b           pick which downloaded model to run
+#                                     (27b | 2.4t | 397b, or any substring)
+#   bash run.sh --plan                show what it WOULD run, then stop
 #   bash run.sh -p "your prompt" -n 64
 #
 # Env: MINILLM_LLAMA_BIN, HF_HUB_CACHE, MINILLM_MODEL_PATTERN, MINILLM_THREADS
@@ -43,7 +46,7 @@ PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 THREADS="${MINILLM_THREADS:-$PHYS}"
 THREADS_BATCH="${MINILLM_THREADS_BATCH:-$(nproc)}"
 
-mode=bench; draft=0; warm=0; lock=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
+mode=bench; draft=0; warm=0; lock=0; plan=0; prompt="Explain, in three sentences, why mixture-of-experts models can run on machines with far less RAM than the model size."; ntok=32; extra=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --chat)  mode=chat; shift ;;
@@ -51,6 +54,8 @@ while [[ $# -gt 0 ]]; do
     --warm)  warm=1; shift ;;
     --lock)  lock=1; shift ;;
     --no-shim) MINILLM_SHIM=0; shift ;;
+    --model) MODEL_ALIAS="$2"; shift 2 ;;
+    --plan)  plan=1; shift ;;
     -p|--prompt) prompt="$2"; shift 2 ;;
     -n) ntok="$2"; shift 2 ;;
     -t|--threads) THREADS="$2"; shift 2 ;;
@@ -59,17 +64,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Short names for the models the installer knows, so switching between two
+# that are both already downloaded needs no environment edit and no reinstall.
+case "${MODEL_ALIAS:-}" in
+  "")                ;;
+  27b|qwen3.8-27b)   PATTERN="Qwen3.8-27B-" ;;
+  2.4t|qwen3.8-2.4t) PATTERN="Qwen3.8-2.4T-A95B-" ;;
+  397b|qwen3.5-397b) PATTERN="Qwen3.5-397B-A17B-" ;;
+  *)                 PATTERN="$MODEL_ALIAS" ;;
+esac
+
 # --- locate model: shard 00001 of a split GGUF, or a single file ------------
 # HF cache files under snapshots/ are SYMLINKS to blobs/, so -L is required
 # (plain 'find -type f' silently finds nothing). Restrict to snapshots/ so a
 # half-downloaded blobs/*.incomplete can never be picked.
 findgguf() { find -L "$CACHE" -path '*/snapshots/*' -type f -name "$1" 2>/dev/null | sort | head -1 || true; }
 model=$(findgguf "*${PATTERN}*-00001-of-*.gguf")
-[[ -n "$model" ]] || model=$(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*${PATTERN}*.gguf" ! -name "*-of-*" 2>/dev/null | sort | head -1 || true)
+# NOT_MAIN: a draft head or a vision projector carries the model's name in its
+# filename, so a substring match finds them too. Running one as the model would
+# "work" and produce nonsense.
+NOT_MAIN=( ! -iname "mtp-*" ! -iname "*MTP-ONLY*" ! -iname "mmproj*" ! -iname "*DFlash*" )
+[[ -n "$model" ]] || model=$(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*${PATTERN}*.gguf" ! -name "*-of-*" "${NOT_MAIN[@]}" 2>/dev/null | sort | head -1 || true)
 # Pattern missed? If exactly one split model (excluding MTP drafts) is present,
 # use it -- the common case after install.sh with any MINILLM_MODEL.
 if [[ -z "$model" ]]; then
-  mapfile -t firsts < <(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*-00001-of-*.gguf" ! -iname "*MTP-ONLY*" 2>/dev/null | sort)
+  mapfile -t firsts < <(find -L "$CACHE" -path '*/snapshots/*' -type f -name "*-00001-of-*.gguf" "${NOT_MAIN[@]}" 2>/dev/null | sort)
   if [[ ${#firsts[@]} -eq 1 ]]; then
     model="${firsts[0]}"; echo "note   : pattern '$PATTERN' not found; using the only model present"
   elif [[ ${#firsts[@]} -gt 1 ]]; then
@@ -100,6 +119,29 @@ if [[ "$model" =~ -00001-of-([0-9]{5})\.gguf$ ]]; then
   fi
 fi
 
+# --- regime: does this model fit in RAM? --------------------------------------
+# Every setting below turns on this one question, and the answer is a property
+# of the file in front of us rather than of the project. A 27B dense model at
+# Q4 is 17.6 GB and fits; the 2.4T MoE at IQ2 is 612 GB and does not. They want
+# opposite flags, so measure instead of assuming either.
+model_b=0
+if [[ "$model" =~ -00001-of-([0-9]{5})\.gguf$ ]]; then
+  _ns=$((10#${BASH_REMATCH[1]}))
+  for ((i=1; i<=_ns; i++)); do
+    f="${model/-00001-of-/-$(printf '%05d' "$i")-of-}"
+    [[ -f "$f" ]] && model_b=$(( model_b + $(stat -Lc%s "$f" 2>/dev/null || echo 0) ))
+  done
+else
+  model_b=$(stat -Lc%s "$model" 2>/dev/null || echo 0)
+fi
+_avail_b=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) * 1024 ))
+# Headroom for the KV cache, compute buffers and the OS. A model that only just
+# fits is worse than one that plainly does not: it thrashes at the margin
+# instead of streaming predictably.
+_head_b=$(( ${MINILLM_HEADROOM_GB:-4} * 1024 * 1024 * 1024 ))
+fits=0
+[[ $model_b -gt 0 && $(( model_b + _head_b )) -lt $_avail_b ]] && fits=1
+
 # --- binary + flags -----------------------------------------------------------
 # Three binaries, three jobs (all verified against llama.cpp b10437):
 #   llama-completion : plain generation. Honors --no-repack, exits when done,
@@ -117,18 +159,44 @@ else
 fi
 [[ -x "$exe" ]] || { echo "missing $exe -- run install.sh (step 4 builds llama.cpp)" >&2; exit 1; }
 
-# --no-repack is mandatory above RAM and is not the default. -c 4096 keeps the
-# KV cache small; raise it for long prompts once you know the RAM headroom.
-args=(-m "$model" -t "$THREADS" -tb "$THREADS_BATCH" -ngl 0 --no-repack --load-mode mmap -c 4096)
+args=(-m "$model" -t "$THREADS" -tb "$THREADS_BATCH" -ngl 0 --load-mode mmap -c "${MINILLM_CTX:-4096}")
+if [[ $fits == 0 ]]; then
+  # Above RAM, repack is fatal rather than merely unhelpful: it copies tensors
+  # OUT of the mapping into anonymous memory, so a 612 GB model would try to
+  # allocate 612 GB. It is not the default, so it has to be asked for.
+  args+=(--no-repack)
+else
+  # It fits. Repack is now free and worth having -- llama.cpp rewrites Q4_K,
+  # Q4_0, IQ4_NL and MXFP4 into AVX2-friendly layouts for a real GEMM speedup.
+  # (The Q5_K and Q6_K repack kernels are NEON-only, so those quants get
+  # nothing from it on an Intel laptop. That is why the catalog defaults the
+  # 27B to a Q4_K variant rather than a bigger one.)
+  #
+  # MAP_POPULATE is also right here: one sequential pass at load and then the
+  # whole model is resident. Stripping it is the shim's entire purpose, so the
+  # shim must be off -- unless it was explicitly asked for.
+  MINILLM_SHIM="${MINILLM_SHIM:-0}"
+fi
 if [[ $draft == 1 ]]; then
+  # a4lg ships "<model>-MTP-ONLY-<quant>.gguf"; unsloth ships
+  # "MTP/mtp-<model>-<quant>.gguf". Try both before giving up.
   d=$(findgguf "*MTP-ONLY*.gguf")
-  [[ -n "$d" ]] || { echo "--draft: no *MTP-ONLY*.gguf under $CACHE" >&2; exit 1; }
+  [[ -n "$d" ]] || d=$(findgguf "mtp-*.gguf")
+  [[ -n "$d" ]] || { echo "--draft: no MTP draft (*MTP-ONLY*.gguf or mtp-*.gguf) under $CACHE" >&2; exit 1; }
   # MTP-ONLY is the model's own prediction head, not a standalone draft model:
   # llama.cpp must be told with --spec-type draft-mtp (per the a4lg README).
   # Each verify pass reads the always-hot weights ONCE for k+1 tokens, so a
   # deeper draft directly divides the un-cacheable cost. Speculative decoding
   # is mathematically lossless: output matches non-speculative decoding.
   args+=(-md "$d" --spec-type draft-mtp --spec-draft-n-max "${MINILLM_DRAFT_N:-5}")
+fi
+
+if [[ $lock == 1 && $fits == 1 ]]; then
+  echo "note   : --lock ignored -- this model fits in RAM, so every byte is"
+  echo "         resident already. Pinning only buys anything when the page"
+  echo "         cache is being forced to evict weights it will need again."
+  echo
+  lock=0
 fi
 
 if [[ $lock == 1 ]]; then
@@ -249,6 +317,13 @@ awk '
     if (a/1048576 < 6)
       printf "  WARNING: only %.1f GB available. Anonymous memory will go to swap and\n         swap reads compete with model reads on the same disk.\n         Try a smaller pin:  MINILLM_LOCK_GB=16 bash run.sh --lock\n", a/1048576
   }' /proc/meminfo
+if [[ $fits == 1 ]]; then
+  echo "regime : FITS IN RAM ($(( model_b / 1024 / 1024 / 1024 )) GB model, $(( _avail_b / 1024 / 1024 / 1024 )) GB available)"
+  echo "         repack on, no streaming, no pinning -- speed is DRAM bandwidth"
+else
+  echo "regime : LARGER THAN RAM ($(( model_b / 1024 / 1024 / 1024 )) GB model, $(( _avail_b / 1024 / 1024 / 1024 )) GB available)"
+  echo "         --no-repack, weights stream from disk every token"
+fi
 echo "model  : $model"
 echo "binary : $exe"
 echo "threads: $THREADS gen / $THREADS_BATCH batch   draft: $draft   mode: $mode   warm: $warm   lock: $lock"
@@ -259,6 +334,20 @@ else
 fi
 echo "note   : first token is cold (page cache empty); the steady-state rate is what matters"
 echo
+
+if [[ $plan == 1 ]]; then
+  echo
+  echo "would run:"
+  printf '  %q' "$exe" "${args[@]}"
+  [[ $mode != chat ]] && printf ' %q' -n "$ntok" --perf
+  echo
+  echo
+  echo "  fits in RAM : $fits   (1 = repack on, shim off, nothing streams)"
+  echo "  model bytes : $model_b"
+  echo "  avail bytes : $_avail_b"
+  echo "  shim        : ${SHIM:-none}"
+  exit 0
+fi
 
 if [[ $mode == chat ]]; then
   if [[ -n "$SHIM" ]]; then

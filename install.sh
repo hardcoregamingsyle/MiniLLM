@@ -73,7 +73,15 @@ MARK_END="# <<< MiniLLM <<<"
 #   qwen3.8-2.4t  2.4T total / 95B active. UD-IQ2_XXS. 656 GB + 20 GB draft.
 #                 Same machine: ~0.3-0.9 tok/s; MTP HURTS at PCIe 3.0 speeds
 #                 because drafting touches more experts than the disk can feed.
-MODELS_KNOWN="qwen3.5-397b qwen3.8-2.4t"
+#   qwen3.8-27b   27B DENSE -- a different regime entirely. UD-Q4_K_XL is
+#                 17.6 GB and FITS in 32 GB, so nothing streams: no expert
+#                 routing, no hot-set pinning, no disk in the inner loop. Speed
+#                 is then DRAM bandwidth over model size, ~1.3-1.5 tok/s on
+#                 DDR4-2666, and the 1.4 GB MTP draft can roughly double it.
+#                 Q4_K is also the only family with AVX2 repack kernels on this
+#                 CPU (Q5_K/Q6_K repack is NEON-only), so a bigger quant costs
+#                 twice: more bytes per token AND slower kernels.
+MODELS_KNOWN="qwen3.5-397b qwen3.8-2.4t qwen3.8-27b"
 resolve_model() {
   local name="$1" quant="${2:-}"
   case "$name" in
@@ -84,6 +92,7 @@ resolve_model() {
       DRAFT_REPO="a4lg/Qwen3.5-397B-A17B-MTP-ONLY-GGUF"
       DRAFT_FILE="Qwen3.5-397B-A17B-MTP-ONLY-Q4_K_M.gguf"
       DRAFT_BYTES=6233573120
+      MODEL_FILES="${MINILLM_QUANT}/*"
       MODEL_PATTERN="Qwen3.5-397B-A17B-${MINILLM_QUANT}"
       ;;
     qwen3.8-2.4t)
@@ -93,7 +102,22 @@ resolve_model() {
       DRAFT_REPO="a4lg/Qwen3.8-2.4T-A95B-MTP-ONLY-GGUF"
       DRAFT_FILE="Qwen3.8-2.4T-A95B-MTP-ONLY-Q4_K_M.gguf"
       DRAFT_BYTES=19897255520
+      MODEL_FILES="${MINILLM_QUANT}/*"
       MODEL_PATTERN="Qwen3.8-2.4T-A95B-${MINILLM_QUANT}"
+      ;;
+    qwen3.8-27b)
+      MODEL_REPO="unsloth/Qwen3.8-27B-GGUF"
+      # UD-Q4_K_XL: the largest Q4_K variant, so the best quality that still
+      # gets AVX2 repack kernels. Q5/Q6 are both bigger AND lose the repack.
+      MINILLM_QUANT="${quant:-UD-Q4_K_XL}"
+      declare -gA QUANT_BYTES=( [UD-Q4_K_XL]=17559178144 [UD-Q4_K_M]=16464440224 [UD-Q4_K_S]=15358213024 [UD-IQ4_XS]=14252845984 [UD-Q5_K_M]=19771509664 [UD-Q6_K]=21983677344 [UD-Q3_K_XL]=13146393504 [UD-Q2_K_XL]=9828981664 [UD-IQ2_XXS]=7266070528 [Q8_0]=29047086048 )
+      # Draft lives in the SAME repo, under MTP/. One download source.
+      DRAFT_REPO="unsloth/Qwen3.8-27B-GGUF"
+      DRAFT_FILE="MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+      DRAFT_BYTES=1369590656
+      # Quants are files at the repo root here, not directories.
+      MODEL_FILES="Qwen3.8-27B-${MINILLM_QUANT}.gguf"
+      MODEL_PATTERN="Qwen3.8-27B-${MINILLM_QUANT}"
       ;;
     *) return 1 ;;
   esac
@@ -125,7 +149,9 @@ NEED_B=$(( ${QUANT_BYTES[$MINILLM_QUANT]:-0} + DRAFT_BYTES ))
 # of the model had landed -- and "just re-run to resume" would be a lie. The
 # repo dirs do not exist on a fresh install, so guard each one.
 HAVE_B=0
-for d in "$HF_CACHE_DIR/models--${MODEL_REPO//\//--}" "$HF_CACHE_DIR/models--${DRAFT_REPO//\//--}"; do
+# Deduplicated: for some models the draft ships in the SAME repo, and counting
+# that directory twice would understate what still has to be downloaded.
+for d in $(printf '%s\n' "$HF_CACHE_DIR/models--${MODEL_REPO//\//--}" "$HF_CACHE_DIR/models--${DRAFT_REPO//\//--}" | sort -u); do
   [[ -d "$d" ]] || continue
   b=$(du -sB1 "$d" 2>/dev/null | cut -f1) || b=0
   HAVE_B=$(( HAVE_B + ${b:-0} ))
@@ -317,7 +343,7 @@ resolve_model "$name" "$quant" || { echo "Unknown model '$name'. Known: $MODELS_
 cd "$MINILLM_DIR" && source .venv/bin/activate
 rc=0
 echo "== $name : main model  $MODEL_REPO / $MINILLM_QUANT"
-python scripts/fetch_model.py --repo "$MODEL_REPO" --files "$MINILLM_QUANT/*" --workers 8 || rc=$?
+python scripts/fetch_model.py --repo "$MODEL_REPO" --files "$MODEL_FILES" --workers 8 || rc=$?
 if [[ $rc -eq 0 ]]; then
   echo "== $name : MTP draft   $DRAFT_REPO / $DRAFT_FILE"
   python scripts/fetch_model.py --repo "$DRAFT_REPO" --files "$DRAFT_FILE" || rc=$?
@@ -352,9 +378,19 @@ else
     n_have=$(find -L "$MODEL_SNAP" -type f -name "*${MINILLM_QUANT}*-of-*.gguf" 2>/dev/null | wc -l)
     [[ $n_have -ge $n_shards ]] && model_done=1
     printf '    model shards present: %s / %s\n' "$n_have" "$n_shards"
+  else
+    # Not split: a single .gguf, which is how the 27B ships. Absence of a
+    # shard 1 is not evidence of an incomplete download here.
+    one=$(find -L "$MODEL_SNAP" -type f -name "*${MINILLM_QUANT}*.gguf" ! -name "*-of-*" 2>/dev/null | head -1 || true)
+    if [[ -n "$one" ]]; then
+      model_done=1
+      printf '    model file present  : %s\n' "$(basename "$one")"
+    fi
   fi
   draft_done=0
-  [[ -n "$(find -L "$DRAFT_SNAP" -type f -name "$DRAFT_FILE" 2>/dev/null | head -1)" ]] && draft_done=1
+  # -name matches a basename, never a path, and DRAFT_FILE may carry a
+  # subdirectory (the 27B draft is MTP/mtp-...gguf).
+  [[ -n "$(find -L "$DRAFT_SNAP" -type f -name "${DRAFT_FILE##*/}" 2>/dev/null | head -1)" ]] && draft_done=1
 
   # One tmux session PER MODEL, so a running 397B download never blocks
   # starting the 2.4T. A finished/crashed session (no fetch_model of THIS

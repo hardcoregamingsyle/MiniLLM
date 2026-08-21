@@ -113,7 +113,9 @@ If that last line prints your username, downloads will run authenticated
 after this works unauthenticated.
 
 **Choosing the model and quant.** The installer's default is
-`Qwen3.5-397B-A17B` at `UD-Q4_K_XL`; `MINILLM_MODEL=qwen3.8-2.4t` selects the
+`Qwen3.5-397B-A17B` at `UD-Q4_K_XL`; `MINILLM_MODEL=qwen3.8-27b` selects the
+27B dense model (17.6 GB, fits in RAM on a 32 GB box);
+`MINILLM_MODEL=qwen3.8-2.4t` selects the
 2.4T at `UD-IQ2_XXS`. Here is why, with exact sizes read from the Hub:
 
 | Model / quant | Size | Fits 920 GB? | tok/s here (single / +MTP) |
@@ -139,6 +141,7 @@ Both fit alongside each other. **To fetch a specific model, name it:**
 
 ```bash
 bash ~/minillm/download.sh qwen3.8-2.4t          # the 2.4T
+bash ~/minillm/download.sh qwen3.8-27b          # the 27B dense (17.6 GB)
 bash ~/minillm/download.sh qwen3.5-397b          # the 397B (the default)
 bash ~/minillm/download.sh qwen3.5-397b UD-Q6_K  # a different quant of it
 ```
