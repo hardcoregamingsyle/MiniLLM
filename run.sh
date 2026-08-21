@@ -235,8 +235,8 @@ print("---------------- wall clock ----------------")
 print(f"  total      : {d:.1f} s for {n} tokens (exit {rc})")
 if n > 0 and d > 0:
     print(f"  per token  : {d/n:.2f} s/token   =   {n/d:.4f} tok/s")
-    print("  NOTE: includes model load. Use tools/measure.sh for the")
-    print("        load-free steady-state number.")
+    print("  NOTE: includes model load. The per-phase table below")
+    print("        separates generation from it -- read that one.")
 # 4 counters before + 4 after when /proc/vmstat had all three keys.
 if len(a) >= 10:
     pin0, mf0, sw0 = (int(x) for x in a[4:7])
