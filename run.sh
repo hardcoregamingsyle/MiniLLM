@@ -133,7 +133,16 @@ if [[ $lock == 1 ]]; then
     : > "$LOCKLOG"
     # The redirect must happen INSIDE the root shell: `sudo cmd > file` would
     # open the file as the invoking user (shellcheck SC2024).
-    sudo -b sh -c "exec python3 '$here/tools/lock_hot.py' '$model' >>'$LOCKLOG' 2>&1" || true
+    # MINILLM_LOCK_GB caps the pin. When the hot set exceeds RAM, pinning as
+    # much as fits still removes those bytes from every future token's read.
+    # Default: leave 6 GB for the expert cache, KV cache and compute buffers.
+    _lockgb="${MINILLM_LOCK_GB:-}"
+    if [[ -z "$_lockgb" ]]; then
+      _memgb=$(awk '/MemTotal/{printf "%.0f", $2/1048576}' /proc/meminfo)
+      _lockgb=$(( _memgb > 10 ? _memgb - 6 : 4 ))
+    fi
+    echo "  pin budget: ${_lockgb} GB"
+    sudo -b sh -c "exec python3 '$here/tools/lock_hot.py' '$model' --max-gb '$_lockgb' >>'$LOCKLOG' 2>&1" || true
     for _ in $(seq 1 60); do
       grep -qE "^locked |RLIMIT_MEMLOCK|failed" "$LOCKLOG" 2>/dev/null && break
       sleep 1

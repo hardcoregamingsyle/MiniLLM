@@ -207,6 +207,10 @@ def main():
     ap.add_argument("--pattern")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stop", action="store_true", help="release a running locker")
+    ap.add_argument("--max-gb", type=float, default=0.0,
+                    help="pin at most N GB. When the hot set is LARGER than RAM, "
+                         "pinning as much as fits is still a large win: every "
+                         "pinned byte is one never re-read again. 0 = pin it all.")
     ap.add_argument("--hold-seconds", type=int, default=0,
                     help="hold the lock for N seconds then release (0 = forever). "
                          "Lets a script verify the lock without backgrounding.")
@@ -248,6 +252,27 @@ def main():
         return 1
 
     per_file, hot_b, exp_b = plan(files)
+    if args.max_gb > 0 and hot_b > args.max_gb * GB:
+        # Trim to the budget. Any subset works: every hot tensor is touched
+        # exactly once per token, so they are equally valuable to pin -- what
+        # matters is only how many bytes stop being re-read.
+        budget, trimmed, kept = args.max_gb * GB, {}, 0
+        for path, ranges in per_file.items():
+            keep = []
+            for off, size in ranges:
+                if kept >= budget:
+                    break
+                take = min(size, int(budget - kept))
+                if take < PAGE:
+                    break
+                keep.append((off, take))
+                kept += take
+            if keep:
+                trimmed[path] = keep
+        print(f"budget {args.max_gb:.1f} GB: pinning {kept / GB:.2f} of "
+              f"{hot_b / GB:.2f} GB hot; the remaining "
+              f"{(hot_b - kept) / GB:.2f} GB still streams each token.")
+        per_file, hot_b = trimmed, kept
     print(f"files          : {len(per_file)}")
     print(f"hot (to lock)  : {hot_b / GB:8.2f} GB in "
           f"{sum(len(v) for v in per_file.values())} regions")
