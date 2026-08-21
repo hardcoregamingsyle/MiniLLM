@@ -19,6 +19,7 @@ models--*/
 bench_scratch/
 results/*.log
 results/*.err
+results/*.tsv
 
 # Secrets. HF_TOKEN goes in the environment, not the tree.
 .env

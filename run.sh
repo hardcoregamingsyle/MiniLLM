@@ -184,29 +184,84 @@ fi
 # decimal, so it prints "Generation: 0.0 t/s" for anything slower than
 # 20 s/token -- 45 s/token and 25 s/token look identical in it. That is
 # useless on a machine where we are trying to move exactly that number.
+# Snapshot kernel I/O counters around the run. /proc/vmstat pgpgin counts
+# kilobytes paged in from block devices system-wide, so (after-before) is the
+# EXACT number of bytes this run pulled off the disk -- no guessing from
+# vmstat's rounded per-second column. pgmajfault is the number of faults that
+# caused those reads, and bytes/fault says whether readahead is doing anything:
+# 4 KB/fault means every fault went to disk alone, 2 MB/fault means it is
+# batching properly. pswpin separates "reading the model" from "thrashing".
+_iosnap() { awk '/^(pgpgin|pgmajfault|pswpin) /{printf "%s ", $2}' /proc/vmstat; }
+# Sample the counters through the run as well, so the bytes can be attributed
+# to load / prompt / generation separately. Only the generation number decides
+# tokens per second; a whole-run total is dominated by the multi-minute load
+# and says nothing useful.
+mkdir -p "$here/results"
+RUNLOG="$here/results/run.log"
+TRACE="$here/results/io_trace.tsv"
+python3 "$here/tools/iotrace.py" sample "$TRACE" --hz 4 &
+sampler=$!
+trap 'kill "$sampler" 2>/dev/null || true' EXIT
+
+io0=$(_iosnap)
 t0=$(date +%s.%N)
+# pipefail + set -e would abort on a non-zero exit before rc is read, and a
+# trailing "|| true" resets PIPESTATUS. Turn -e off for exactly this pipeline.
+set +e
 if [[ $draft == 1 ]]; then
   # llama-cli path: -st = answer once then exit.
-  "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null
+  "$exe" "${args[@]}" -n "$ntok" -st --perf --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
 else
-  "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null
+  "$exe" "${args[@]}" -n "$ntok" --perf -no-cnv --no-warmup -p "$prompt" "${extra[@]}" </dev/null 2>&1 | tee "$RUNLOG"
 fi
-rc=$?
+rc=${PIPESTATUS[0]}
+set -e
 t1=$(date +%s.%N)
+io1=$(_iosnap)
+kill "$sampler" 2>/dev/null || true
+wait "$sampler" 2>/dev/null || true
 
 # Timing math in python3, not awk: the report needs literal newlines and
 # getting those through shell quoting into an awk program is a known way to
 # produce "runaway string constant". python3 is already a hard dependency.
-python3 - "$t0" "$t1" "$ntok" "$rc" <<'PYTIME'
+python3 - "$t0" "$t1" "$ntok" "$rc" $io0 $io1 <<'PYTIME'
 import sys
-t0, t1, n, rc = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+a = sys.argv[1:]
+t0, t1, n, rc = float(a[0]), float(a[1]), int(a[2]), a[3]
 d = t1 - t0
+GB = 1024 ** 3
 print("")
 print("---------------- wall clock ----------------")
 print(f"  total      : {d:.1f} s for {n} tokens (exit {rc})")
 if n > 0 and d > 0:
     print(f"  per token  : {d/n:.2f} s/token   =   {n/d:.4f} tok/s")
-    print("  NOTE: includes model load. Re-run for the warm figure, and")
-    print("        compare THIS number between settings, not the 1-decimal meter.")
+    print("  NOTE: includes model load. Use tools/measure.sh for the")
+    print("        load-free steady-state number.")
+# 4 counters before + 4 after when /proc/vmstat had all three keys.
+if len(a) >= 10:
+    pin0, mf0, sw0 = (int(x) for x in a[4:7])
+    pin1, mf1, sw1 = (int(x) for x in a[7:10])
+    read_b = (pin1 - pin0) * 1024
+    faults = mf1 - mf0
+    swapped = (sw1 - sw0) * 4096
+    print("")
+    print("---------------- disk I/O ------------------")
+    print(f"  read from disk : {read_b / GB:8.2f} GB")
+    if d > 0:
+        print(f"  effective rate : {read_b / GB / d:8.3f} GB/s   <- the real ceiling")
+    if n > 0:
+        print(f"  per token      : {read_b / GB / n:8.2f} GB/token")
+    if faults > 0:
+        kb = read_b / faults / 1024
+        print(f"  major faults   : {faults:,} = {kb:7.1f} kB per fault", end="")
+        print("   (4 kB = readahead is doing NOTHING)" if kb < 16 else "")
+    if swapped > 0:
+        print(f"  SWAPPED IN     : {swapped / GB:8.2f} GB  <- anonymous memory is")
+        print("                   thrashing; that is wasted bandwidth, not model reads")
 PYTIME
+
+# Per-phase attribution. This is the number to move.
+if [[ -s "$TRACE" ]]; then
+  python3 "$here/tools/iotrace.py" report "$TRACE" "$RUNLOG" || true
+fi
 exit $rc

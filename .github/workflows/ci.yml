@@ -317,6 +317,45 @@ jobs:
           set -e
           [ $rc -ne 0 ] && echo "correctly refused (exit $rc)" || { echo "::error::--draft ran without a draft file"; exit 1; }
 
+      - name: iotrace attributes disk reads to the right phase
+        run: |
+          source .venv/bin/activate
+          mkdir -p results
+          dd if=/dev/urandom of=/tmp/iotest.bin bs=1M count=512 status=none
+          sync
+          python tools/iotrace.py sample results/ci_trace.tsv --hz 20 &
+          S=$!
+          sleep 2
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+          r0=$(date +%s.%N)
+          cat /tmp/iotest.bin > /dev/null
+          r1=$(date +%s.%N)
+          sleep 0.2
+          kill $S 2>/dev/null || true; wait $S 2>/dev/null || true
+          python - "$r0" "$r1" <<'EOF'
+          import sys
+          ms = (float(sys.argv[2]) - float(sys.argv[1])) * 1000.0
+          # Fake a --perf block whose eval phase is exactly the 512 MB read, so
+          # a correct report must attribute ~0.5 GB to "generation" and ~0 to
+          # the two idle seconds before it.
+          open("results/ci_run.log", "w").write(
+              "llama_perf_context_print:        load time =  1000.00 ms\n"
+              "llama_perf_context_print: prompt eval time =  1000.00 ms / 8 tokens\n"
+              "llama_perf_context_print:        eval time =  %.2f ms / 4 runs\n" % ms)
+          EOF
+          python - <<'EOF'
+          import re, subprocess, sys
+          out = subprocess.run([sys.executable, "tools/iotrace.py", "report",
+                                "results/ci_trace.tsv", "results/ci_run.log"],
+                               capture_output=True, text=True)
+          print(out.stdout); print(out.stderr, file=sys.stderr)
+          m = re.search(r"generation\s+[\d.]+ s\s+([\d.]+) GB", out.stdout)
+          assert m, "report produced no generation line"
+          gb = float(m.group(1))
+          assert gb > 0.3, f"generation window saw {gb} GB, expected ~0.5"
+          print(f"OK: {gb:.2f} GB attributed to the generation window")
+          EOF
+
       - name: upload results
         if: always()
         uses: actions/upload-artifact@v4
